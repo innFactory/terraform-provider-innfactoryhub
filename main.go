@@ -11,7 +11,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 
-	"github.com/innFactory/innfactoryHUB-Provider/internal/provider"
+	"github.com/innFactory/terraform-provider-innfactoryhub/internal/provider"
 )
 
 // Set by GoReleaser via -ldflags at build time. Surfaced in the User-Agent
