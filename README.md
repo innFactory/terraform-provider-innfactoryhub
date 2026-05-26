@@ -1,8 +1,10 @@
+<a href="https://www.innfactory.de"><img src="https://innfactory.de/images/innfactory-logo.png" alt="innFactory" height="64"></a>
+
 # Terraform Provider for innFactory Hub
 
 Manages reseller API keys and reads tenant identifiers in [innFactory Hub](https://hub.innfactory.cloud).
 
-Intended primarily for CompanyGPT customer deployments: at deploy-time of a customer's stack, resolve the right Hub tenant from the GCP project ID, mint a read-only org-scoped API key, and feed it to the dashboard's runtime as a sensitive output.
+Intended primarily for CompanyGPT customer deployments: at deploy-time of a customer's stack, resolve the right Hub tenant from the GCP project ID (or Azure subscription / Azure tenant / AWS account / Hub tenant_id), mint a read-only org-scoped API key, and feed it to the dashboard's runtime as a sensitive output.
 
 ## Quick start
 
@@ -32,6 +34,27 @@ resource "innfactoryhub_api_key" "companygpt" {
 
 Export `INNFACTORYHUB_ADMIN_KEY` with a system-scope admin key (mint one in *Hub → Stammdaten → API-Keys*).
 
+### Resolving a tenant — five ways
+
+Pass exactly one of these to `data "innfactoryhub_tenant"`:
+
+| Input | Use when |
+|---|---|
+| `tenant_id` | You already know the Hub `tnt_…` id (direct fetch, no scan) |
+| `gcp_project_id` | The deploy env runs on GCP and knows its project ID |
+| `azure_subscription_id` | The deploy env knows its Azure subscription |
+| `azure_tenant_id` | You only know the Entra ID directory (Azure tenant) |
+| `aws_account_id` | The deploy env knows its 12-digit AWS account |
+
+## Security model
+
+This provider holds a **system-scope admin key** that can mint and revoke keys for every customer tenant. Treat it like root.
+
+- The bearer is sent ONLY to `hub.innfactory.cloud` or `*.innfactory.cloud` over HTTPS. Any other endpoint is refused at provider configure time unless you opt out explicitly with `INNFACTORYHUB_INSECURE_ENDPOINT=1` (intended for local dev / staging-via-tunnel).
+- 4xx/5xx response bodies are truncated to 512 bytes and scrubbed for `ak_…` shapes before reaching Terraform diagnostics — so a misbehaving proxy that echoes the Authorization header into an error page can't leak the key into CI logs.
+- The HTTP transport pins TLS ≥ 1.2.
+- The plaintext token lives in Terraform state. Use a backend with encryption-at-rest (GCS+CMEK, S3+KMS, Terraform Cloud).
+
 ## Development
 
 ```bash
@@ -43,7 +66,7 @@ For local debugging, run `./terraform-provider-innfactoryhub --debug` and follow
 
 ## Releases
 
-Tagged via `git tag v0.1.0 && git push --tags`. GoReleaser cross-compiles for darwin/linux/windows × amd64/arm64, signs with GPG, and publishes to the GitHub Releases page; the public Terraform Registry pulls from there.
+Tagged via `git tag v0.1.0 && git push --tags`. GoReleaser cross-compiles for darwin/linux/windows × amd64/arm64, signs the checksum file with GPG, and publishes to GitHub Releases. The public Terraform Registry polls that page automatically.
 
 ## Keeping the provider in sync with the Hub API
 
@@ -54,6 +77,15 @@ The Hub repo runs `pnpm openapi:check` in CI which fails when [`docs/api/openapi
 3. Cut a new minor version of this provider.
 
 There's no automated sync — the contract is "spec changes → provider PR within the same week."
+
+---
+
+## Credits
+
+Built and maintained by [innFactory GmbH](https://www.innfactory.de) — cloud, software, and AI consulting.
+
+- 🌐 Web · [innfactory.de](https://www.innfactory.de)
+- 🤖 AI offering · [innfactory.ai](https://www.innfactory.ai)
 
 ## License
 

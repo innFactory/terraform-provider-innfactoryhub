@@ -3,12 +3,14 @@ package provider
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-log/tflog"
@@ -16,25 +18,33 @@ import (
 
 // Hub admin API client used by every resource + data source. Wraps net/http
 // with a User-Agent that identifies the provider version (so Hub audit_log
-// can attribute changes), a 30s timeout, and structured tflog tracing.
+// can attribute changes), a 30s timeout, structured tflog tracing, and
+// TLS 1.2+ enforcement.
 //
 // Authentication: the system-scope `ak_…` key is sent as
 // `Authorization: Bearer ak_<id>.<secret>` exactly as the Hub expects.
-// The key is NEVER logged — see `tflog.MaskFieldValuesStrings` set up in
-// resource Configure().
+// The key is NEVER logged. Error bodies are redacted before reaching
+// diagnostics so a misbehaving upstream proxy that echoes the Authorization
+// header into a 502 page cannot leak the bearer into CI logs.
 type httpClient struct {
-	base       string
-	adminKey   string
-	userAgent  string
-	http       *http.Client
+	base      string
+	adminKey  string
+	userAgent string
+	http      *http.Client
 }
 
 func newClient(endpoint, adminKey, version string) *httpClient {
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	}
 	return &httpClient{
 		base:      endpoint,
 		adminKey:  adminKey,
 		userAgent: fmt.Sprintf("terraform-provider-innfactoryhub/%s", version),
-		http:      &http.Client{Timeout: 30 * time.Second},
+		http: &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: tr,
+		},
 	}
 }
 
@@ -59,6 +69,25 @@ func isNotFound(err error) bool {
 	}
 	return false
 }
+
+// Matches the `ak_<id>.<secret>` wire shape so we can strip the bearer from
+// any text we are about to surface as a diagnostic. Conservative: cuts
+// anything that even looks like the prefix, including substrings.
+var akKeyPattern = regexp.MustCompile(`ak_[A-Za-z0-9_-]{1,64}\.[A-Za-z0-9_-]{1,64}`)
+
+// redact removes anything that looks like an API key from an arbitrary
+// string. Used before propagating a 4xx/5xx body — a misbehaving reverse
+// proxy or upstream debug page that echoes the request's Authorization
+// header would otherwise put the bearer into a Terraform error message and
+// thus into CI logs.
+func redact(s string) string {
+	return akKeyPattern.ReplaceAllString(s, "ak_***REDACTED***")
+}
+
+// Cap on how much of an unstructured error body we propagate. 512 bytes is
+// plenty to identify the cause but small enough to keep stack traces and
+// debug dumps from leaking through.
+const maxBodyForError = 512
 
 func (c *httpClient) do(ctx context.Context, method, path string, query url.Values, body, out any) error {
 	u := c.base + path
@@ -86,14 +115,17 @@ func (c *httpClient) do(ctx context.Context, method, path string, query url.Valu
 	}
 	req.Header.Set("Accept", "application/json")
 
+	// Log only the path — not the query string — at trace level. The query
+	// can contain customer cloud handles which are not secrets but still
+	// sensitive in shared CI logs.
 	tflog.Trace(ctx, "hub_request", map[string]any{
 		"method": method,
-		"url":    u,
+		"path":   path,
 	})
 
 	res, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("http: %w", err)
+		return fmt.Errorf("http: %w", redactErr(err))
 	}
 	defer res.Body.Close()
 
@@ -108,13 +140,21 @@ func (c *httpClient) do(ctx context.Context, method, path string, query url.Valu
 	})
 
 	if res.StatusCode >= 400 {
-		ae := &apiError{Status: res.StatusCode, Message: string(raw)}
+		ae := &apiError{Status: res.StatusCode}
 		var env struct {
 			Error apiError `json:"error"`
 		}
 		if json.Unmarshal(raw, &env) == nil && env.Error.Code != "" {
 			ae.Code = env.Error.Code
-			ae.Message = env.Error.Message
+			ae.Message = redact(env.Error.Message)
+		} else {
+			// Unstructured body — cap + redact. Avoid raw upstream HTML, proxy
+			// debug pages, etc. leaking the bearer into CI logs.
+			snippet := string(raw)
+			if len(snippet) > maxBodyForError {
+				snippet = snippet[:maxBodyForError] + "…"
+			}
+			ae.Message = redact(snippet)
 		}
 		return ae
 	}
@@ -126,6 +166,21 @@ func (c *httpClient) do(ctx context.Context, method, path string, query url.Valu
 		return fmt.Errorf("decode response: %w", err)
 	}
 	return nil
+}
+
+// redactErr wraps an error such that any printed form runs through redact().
+// Used on transport errors where Go's stdlib sometimes echoes the URL —
+// which won't contain the bearer, but better safe.
+type redactedErr struct{ inner error }
+
+func (r *redactedErr) Error() string { return redact(r.inner.Error()) }
+func (r *redactedErr) Unwrap() error { return r.inner }
+
+func redactErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &redactedErr{inner: err}
 }
 
 // envelope is the Hub's response wrapper: `{ data: <T>, request_id }`.

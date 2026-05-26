@@ -2,7 +2,9 @@ package provider
 
 import (
 	"context"
+	"net/url"
 	"os"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -71,9 +73,45 @@ func (p *innfactoryhubProvider) Configure(ctx context.Context, req provider.Conf
 		return
 	}
 
+	// Endpoint hardening: refuse to send the bearer token to anything that
+	// isn't https + the innfactory.cloud trust boundary. Without this, a
+	// hostile module / typo'd env var / supply-chain compromise could
+	// exfil the admin key to an attacker-controlled host. Operators who
+	// genuinely need a custom endpoint (staging-via-tunnel, local dev) must
+	// opt in explicitly with INNFACTORYHUB_INSECURE_ENDPOINT=1.
+	insecure := os.Getenv("INNFACTORYHUB_INSECURE_ENDPOINT") == "1"
+	if err := validateEndpoint(endpoint, insecure); err != nil {
+		resp.Diagnostics.AddAttributeError(path.Root("endpoint"), "Refusing to send admin key", err.Error())
+		return
+	}
+
 	client := newClient(endpoint, adminKey, p.version)
 	resp.DataSourceData = client
 	resp.ResourceData = client
+}
+
+// validateEndpoint enforces https + an innfactory.cloud hostname suffix unless
+// the caller has explicitly opted into insecure mode. Reject `http://`, raw
+// IPs, and arbitrary domains — those are the credential-exfil vectors a
+// public-registry provider has to defend against.
+func validateEndpoint(raw string, insecure bool) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return errNotAUrl
+	}
+	if u.Scheme != "https" {
+		if !insecure {
+			return errNotHttps
+		}
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "hub.innfactory.cloud" || strings.HasSuffix(host, ".innfactory.cloud") {
+		return nil
+	}
+	if insecure {
+		return nil
+	}
+	return errNotInnfactoryHost
 }
 
 func (p *innfactoryhubProvider) Resources(_ context.Context) []func() resource.Resource {
@@ -87,6 +125,16 @@ func (p *innfactoryhubProvider) DataSources(_ context.Context) []func() datasour
 		newTenantDataSource,
 	}
 }
+
+var (
+	errNotAUrl           = errEndpoint("endpoint is not a valid URL")
+	errNotHttps          = errEndpoint("endpoint must use https:// — set INNFACTORYHUB_INSECURE_ENDPOINT=1 to override for local dev")
+	errNotInnfactoryHost = errEndpoint("endpoint host must be hub.innfactory.cloud or *.innfactory.cloud — set INNFACTORYHUB_INSECURE_ENDPOINT=1 to override for staging-via-tunnel or local dev")
+)
+
+type errEndpoint string
+
+func (e errEndpoint) Error() string { return string(e) }
 
 func strFromAttrOrEnv(v types.String, envKey, fallback string) string {
 	if !v.IsNull() && !v.IsUnknown() && v.ValueString() != "" {

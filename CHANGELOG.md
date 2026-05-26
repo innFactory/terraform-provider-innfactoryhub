@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**Added**
+
+- Data source `innfactoryhub_tenant` accepts two more inputs: `tenant_id` (direct fetch, no scan) and `azure_tenant_id` (Entra ID directory — distinct from a subscription).
+- `azure_tenant_ids` returned as a computed list attribute.
+
+**Security**
+
+- Endpoint host pin: refuses to send the admin key to anything that isn't `https://hub.innfactory.cloud` or `https://*.innfactory.cloud`. Opt-out via `INNFACTORYHUB_INSECURE_ENDPOINT=1` for local dev.
+- 4xx/5xx response bodies are truncated to 512 bytes and stripped of `ak_…` shapes before reaching Terraform diagnostics.
+- TLS ≥ 1.2 pinned on the HTTP transport.
+- Whitespace-only identifiers are rejected at the data-source level instead of producing a confusing 404.
+- `terraform import` now sets `plaintext` to null explicitly and emits a warning.
+
 ## v0.1.0 — 2026-05-26
 
 Initial release.

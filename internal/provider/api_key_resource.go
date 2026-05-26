@@ -219,6 +219,12 @@ func (r *apiKeyResource) Read(ctx context.Context, req resource.ReadRequest, res
 			resp.State.RemoveResource(ctx)
 			return
 		}
+		if k.Scope != "system" && k.Scope != "organization" {
+			resp.Diagnostics.AddWarning(
+				"Unknown scope from Hub",
+				"Key "+k.KeyID+" has scope=\""+k.Scope+"\" — provider only recognises system|organization. Bump the provider version.",
+			)
+		}
 		state.Name = types.StringValue(k.Name)
 		state.Scope = types.StringValue(k.Scope)
 		if k.TenantID != nil {
@@ -261,8 +267,14 @@ func (r *apiKeyResource) Delete(ctx context.Context, req resource.DeleteRequest,
 }
 
 func (r *apiKeyResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	// Imports are by key_id. Note: plaintext can NEVER be recovered on import
-	// (the Hub doesn't store it). Operators who import an existing key cannot
-	// then use `.plaintext` downstream — they must mint a fresh key for that.
+	// Imports are by key_id. Plaintext can NEVER be recovered on import (the
+	// Hub doesn't store it). Set it to null explicitly so any downstream
+	// `output { value = innfactoryhub_api_key.foo.plaintext }` is obviously
+	// null instead of an unknown that drifts at next plan.
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), req.ID)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("plaintext"), types.StringNull())...)
+	resp.Diagnostics.AddWarning(
+		"Plaintext not recoverable on import",
+		"The Hub does not store the plaintext token. .plaintext is null after import; mint a fresh key with this provider if a downstream output needs the token.",
+	)
 }

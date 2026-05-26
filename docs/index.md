@@ -52,9 +52,15 @@ The provider authenticates to the Hub admin API with a **system-scope** API key 
 
 The plaintext is shown exactly once in the Hub UI; copy it carefully.
 
+## Endpoint security
+
+The system-scope admin key can mint and revoke API keys for every customer tenant. To prevent credential exfiltration through a typo, supply-chain compromise, or hostile module, the provider refuses to send the bearer to anything that isn't `https://hub.innfactory.cloud` or `https://*.innfactory.cloud`.
+
+For local dev or staging-via-tunnel, set `INNFACTORYHUB_INSECURE_ENDPOINT=1` to opt out of the host pin. Do not set this in CI.
+
 ## Schema
 
 ### Optional
 
-- `endpoint` (String) Base URL of the Hub admin API. Defaults to `https://hub.innfactory.cloud`. Override via `INNFACTORYHUB_ENDPOINT`.
+- `endpoint` (String) Base URL of the Hub admin API. Defaults to `https://hub.innfactory.cloud`. Override via `INNFACTORYHUB_ENDPOINT`. Must be `https://` and host must end with `.innfactory.cloud` unless `INNFACTORYHUB_INSECURE_ENDPOINT=1`.
 - `admin_key` (String, Sensitive) System-scope admin key. Override via `INNFACTORYHUB_ADMIN_KEY`.
