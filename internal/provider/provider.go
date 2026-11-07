@@ -39,7 +39,7 @@ type providerModel struct {
 
 func (p *innfactoryhubProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Provider for innFactory Hub (hub.innfactory.cloud) and the innFactory AI Hub (hub.innfactory.ai) — manages API keys and environments and reads tenant identifiers.",
+		Description: "Provider for innFactory Hub (hub.innfactory.cloud) and the innFactory AI Hub (hub.innfactory.ai) — manages API keys, environments and licences and reads tenant identifiers.",
 		Attributes: map[string]schema.Attribute{
 			"endpoint": schema.StringAttribute{
 				Optional:    true,
@@ -126,6 +126,7 @@ func (p *innfactoryhubProvider) Resources(_ context.Context) []func() resource.R
 	return []func() resource.Resource{
 		newApiKeyResource,
 		newEnvironmentResource,
+		newLicenseResource,
 	}
 }
 

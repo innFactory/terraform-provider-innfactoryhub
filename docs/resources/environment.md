@@ -7,7 +7,7 @@ description: |-
 
 # innfactoryhub_environment (Resource)
 
-Registers an **environment** — one CompanyGPT / AI Gateway installation of a customer — in the [innFactory AI Hub](https://hub.innfactory.ai). Licences (`innfactoryhub_license`, planned) hang off the environment's `id`.
+Registers an **environment** — one CompanyGPT / AI Gateway installation of a customer — in the [innFactory AI Hub](https://hub.innfactory.ai). Licences ([`innfactoryhub_license`](license.md)) hang off the environment's `id`; the Hub deletes an environment only after its licences have ended, and Terraform destroys the licences first when both are in one configuration.
 
 The customer is named by **exactly one** of `tenant_id`, `azure_tenant_id`, `azure_tenant_domain`, `azure_subscription_id`, `gcp_project_id` or `aws_account_id`. For a cloud identifier the Hub resolves the customer at create time (same rules as `data "innfactoryhub_tenant"`) and returns it as `tenant_id`.
 

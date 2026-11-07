@@ -2,7 +2,7 @@
 page_title: "innfactoryhub Provider"
 subcategory: ""
 description: |-
-  Terraform provider for innFactory Hub and the innFactory AI Hub. Manages API keys and environments and reads tenant identifiers.
+  Terraform provider for innFactory Hub and the innFactory AI Hub. Manages API keys, environments and licences and reads tenant identifiers.
 ---
 
 # innfactoryhub Provider
@@ -12,6 +12,7 @@ The `innfactoryhub` provider talks to both hubs — [innFactory Hub](https://hub
 - Minting and revoking **API keys** scoped to a tenant (`innfactoryhub_api_key`) — both hubs.
 - Resolving a tenant from a cloud handle (`data.innfactoryhub_tenant`) — useful when a deploy environment knows only its own GCP project / Azure subscription / AWS account — both hubs.
 - Registering **environments** (`innfactoryhub_environment`) — one CompanyGPT / AI Gateway installation per customer — AI Hub only.
+- Issuing **licences** (`innfactoryhub_license`) for an environment, with the licence key as a sensitive value — AI Hub only.
 
 Use one provider block per hub; add an `alias` when a configuration talks to both.
 
@@ -24,7 +25,7 @@ terraform {
   required_providers {
     innfactoryhub = {
       source  = "innfactory/innfactoryhub"
-      version = "~> 0.1"
+      version = "~> 0.2"
     }
   }
 }
@@ -62,6 +63,16 @@ resource "innfactoryhub_environment" "ai_gateway" {
   name            = "AI Gateway"
   domain          = "gpt.acme.example"
   cloud           = "azure"
+}
+
+resource "innfactoryhub_license" "ai_gateway" {
+  provider        = innfactoryhub.aihub
+  environment_id  = innfactoryhub_environment.ai_gateway.id
+  product         = "ai-gateway"
+  domains         = [innfactoryhub_environment.ai_gateway.domain]
+  unlimited       = true
+  edition         = "all"
+  unbilled_reason = "internal"
 }
 ```
 

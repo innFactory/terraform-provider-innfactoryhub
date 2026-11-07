@@ -175,3 +175,51 @@ func TestClientTransportErrorsAreRedacted(t *testing.T) {
 		t.Fatalf("expected a redactedErr wrapping the cause, got %T", err)
 	}
 }
+
+// The Hub explains many rejections in error.details (e.g. the editions that
+// exist); the client renders them, capped and redacted like the message.
+func TestClientErrorsCarryDetails(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     string
+		want     string
+		mustSkip []string
+	}{
+		{
+			name: "details rendered",
+			body: `{"error":{"code":"edition_unknown","message":"Edition x gibt es nicht","details":{"available":["all","basic"]}}}`,
+			want: `hub api 422 edition_unknown: Edition x gibt es nicht (details: {"available":["all","basic"]})`,
+		},
+		{
+			name: "no details",
+			body: `{"error":{"code":"license_ended","message":"Die Lizenz ist beendet"}}`,
+			want: `hub api 422 license_ended: Die Lizenz ist beendet`,
+		},
+		{
+			name:     "details redacted",
+			body:     `{"error":{"code":"bad_request","message":"x","details":{"echo":"` + secretLK + `"}}}`,
+			mustSkip: []string{secretLK},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			hub := newFakeHub(t)
+			hub.failAll(http.StatusUnprocessableEntity, tc.body)
+			c := newClient(hub.URL(), testAdminKey, "test")
+
+			err := c.do(context.Background(), http.MethodGet, "/api/v1/admin/licenses/lic_1", nil, nil, nil)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if tc.want != "" && err.Error() != tc.want {
+				t.Fatalf("error\n got: %s\nwant: %s", err, tc.want)
+			}
+			for _, s := range tc.mustSkip {
+				if strings.Contains(err.Error(), s) {
+					t.Fatalf("error leaked %q: %s", s, err)
+				}
+			}
+		})
+	}
+}

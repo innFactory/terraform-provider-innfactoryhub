@@ -38,7 +38,7 @@ func TestProviderServerSmoke(t *testing.T) {
 			t.Fatalf("schema diagnostic: %s: %s", d.Summary, d.Detail)
 		}
 	}
-	for _, name := range []string{"innfactoryhub_api_key", "innfactoryhub_environment"} {
+	for _, name := range []string{"innfactoryhub_api_key", "innfactoryhub_environment", "innfactoryhub_license"} {
 		if _, ok := resp.ResourceSchemas[name]; !ok {
 			t.Errorf("resource %s is not registered", name)
 		}

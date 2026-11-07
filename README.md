@@ -2,9 +2,9 @@
 
 # Terraform Provider for innFactory Hub
 
-Manages API keys and environments and reads tenant identifiers in [innFactory Hub](https://hub.innfactory.cloud) and the [innFactory AI Hub](https://hub.innfactory.ai). Both hubs serve the same tenant-lookup and API-key paths, so one provider talks to either.
+Manages API keys, environments and licences and reads tenant identifiers in [innFactory Hub](https://hub.innfactory.cloud) and the [innFactory AI Hub](https://hub.innfactory.ai). Both hubs serve the same tenant-lookup and API-key paths, so one provider talks to either.
 
-Intended primarily for CompanyGPT customer deployments: at deploy-time of a customer's stack, resolve the right Hub tenant from the GCP project ID (or Azure subscription / Azure tenant / AWS account / Hub tenant_id), mint a read-only org-scoped API key, and feed it to the dashboard's runtime as a sensitive output — and register the customer's AI Gateway installation as an environment in the AI Hub.
+Intended primarily for CompanyGPT customer deployments: at deploy-time of a customer's stack, resolve the right Hub tenant from the GCP project ID (or Azure subscription / Azure tenant / AWS account / Hub tenant_id), mint a read-only org-scoped API key, and feed it to the dashboard's runtime as a sensitive output — and register the customer's AI Gateway installation as an environment in the AI Hub and issue its licence.
 
 ## Quick start
 
@@ -13,7 +13,7 @@ terraform {
   required_providers {
     innfactoryhub = {
       source  = "innfactory/innfactoryhub"
-      version = "~> 0.1"
+      version = "~> 0.2"
     }
   }
 }
@@ -53,6 +53,27 @@ resource "innfactoryhub_environment" "ai_gateway" {
 
 Bind the environment with exactly one of `tenant_id`, `azure_tenant_id`, `azure_tenant_domain`, `azure_subscription_id`, `gcp_project_id`, `aws_account_id`. `name` and `domain` update in place; `cloud` and the customer binding force a new environment. Import with `terraform import innfactoryhub_environment.<name> <environment_id>`. See [docs/resources/environment.md](docs/resources/environment.md).
 
+### Issuing a licence in the innFactory AI Hub
+
+```hcl
+resource "innfactoryhub_license" "ai_gateway" {
+  provider             = innfactoryhub.aihub
+  environment_id       = innfactoryhub_environment.ai_gateway.id
+  product              = "ai-gateway"
+  domains              = ["gpt.acme.example"]
+  max_users            = 50 # or: unlimited = true
+  edition              = "all"
+  contract_position_id = "pos_0123456789ab" # or: unbilled_reason = "trial"
+}
+
+output "license_key" {
+  value     = innfactoryhub_license.ai_gateway.license_key
+  sensitive = true
+}
+```
+
+The licence key (`lk_…`) is returned by the Hub only when the licence is issued; it stays in state and survives every in-place update (`max_users`, domains, edition, billing link …). Changing `environment_id`, `product` or `rotation_trigger` issues a new licence with a new key; destroy ends the licence. After `terraform import` the key is empty. See [docs/resources/license.md](docs/resources/license.md).
+
 ### Resolving a tenant — five ways
 
 Pass exactly one of these to `data "innfactoryhub_tenant"`:
@@ -72,7 +93,7 @@ This provider holds a **system-scope admin key** that can mint and revoke keys f
 - The bearer is sent ONLY over HTTPS to `innfactory.cloud`, `innfactory.ai` or a subdomain of either (e.g. `hub.innfactory.cloud`, `hub.innfactory.ai`). Matching is per DNS label, so `innfactory.ai.evil.com` is refused. Any other endpoint is refused at provider configure time unless you opt out explicitly with `INNFACTORYHUB_INSECURE_ENDPOINT=1` (intended for local dev / staging-via-tunnel).
 - 4xx/5xx response bodies are truncated to 512 bytes, and every error text is scrubbed for API keys (`ak_…`), licence keys (`lk_…`) and JWTs (`eyJ….….…`) before reaching Terraform diagnostics — so a misbehaving proxy that echoes the Authorization header into an error page can't leak a key into CI logs.
 - The HTTP transport pins TLS ≥ 1.2.
-- The plaintext token lives in Terraform state. Use a backend with encryption-at-rest (GCS+CMEK, S3+KMS, Terraform Cloud).
+- The plaintext API key and the licence key live in Terraform state (as sensitive attributes). Use a backend with encryption-at-rest (GCS+CMEK, S3+KMS, Terraform Cloud). Licence files and signed licence tokens are never stored in state.
 
 ## Development
 
@@ -87,7 +108,7 @@ For local debugging, run `./terraform-provider-innfactoryhub --debug` and follow
 
 ## Releases
 
-Tagged via `git tag v0.1.0 && git push --tags`. GoReleaser cross-compiles for darwin/linux/windows × amd64/arm64, signs the checksum file with GPG, and publishes to GitHub Releases. The public Terraform Registry polls that page automatically.
+Tagged via `git tag v0.2.0 && git push --tags` — a manual step after approval. GoReleaser cross-compiles for darwin/linux/windows × amd64/arm64, signs the checksum file with GPG, and publishes to GitHub Releases. The public Terraform Registry polls that page automatically.
 
 ## Keeping the provider in sync with the Hub API
 

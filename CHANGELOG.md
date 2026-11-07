@@ -1,8 +1,18 @@
 # Changelog
 
-## Unreleased
+## v0.2.0 — unreleased
+
+Prepared for release; the tag `v0.2.0` is pushed manually after approval (GoReleaser publishes to the Registry).
 
 **Added**
+
+- Resource `innfactoryhub_license` (innFactory AI Hub): issues a licence for an environment via `POST /api/v1/admin/licenses` with `environment_id`, `product`, `domains`, `max_users` or `unlimited`, `max_instances` (default 5), `edition`, `features` (default: all of the edition), `entitlements`, and exactly one of `contract_position_id` or `unbilled_reason` (+ optional `unbilled_max_until`; without it the Hub's default per reason applies) — both "exactly one" rules are checked at plan time.
+  - `license_key` (sensitive) is set only from the create response and kept unchanged through updates; Read never touches it. After import it is empty, with a warning.
+  - Parameter and billing-link changes update in place with one `PATCH` carrying only the changed fields; re-applying unchanged config plans nothing. `environment_id` and `product` force a new licence.
+  - Key rotation via `rotation_trigger`: any change replaces the licence (the Hub has no rotation endpoint and returns keys only at issue).
+  - Destroy ends the licence (`DELETE`, status `ended`, contract position freed); `404` is tolerated. A licence ended outside Terraform is dropped on refresh and re-issued.
+  - Hub rejections (`position_already_linked`, `edition_unknown`, `unbilled_max_exceeded`, …) come with a remediation hint. No licence file or token is ever stored in state.
+- Hub error `details` (e.g. available editions, the licence holding a position) are shown in diagnostics, capped and redacted like the message.
 
 - Resource `innfactoryhub_environment` (innFactory AI Hub): registers a customer installation via `POST /api/v1/admin/environments`, bound by exactly one of `tenant_id`, `azure_tenant_id`, `azure_tenant_domain`, `azure_subscription_id`, `gcp_project_id`, `aws_account_id`. `name` and `domain` update in place (`PATCH`); `cloud` and the customer binding force replacement; import by `environment_id`. Hub errors `tenant_not_found`, `ambiguous_lookup` and `environment_exists` come with a remediation hint.
 - Endpoint allowlist accepts `innfactory.ai` and its subdomains (e.g. `https://hub.innfactory.ai`) besides `innfactory.cloud`; both apexes are accepted too.

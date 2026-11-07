@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"regexp"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/resourcevalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
@@ -58,15 +57,6 @@ var environmentClouds = []string{"azure", "gcp", "aws", "stackit", "other"}
 
 // customerBindingAttrs are the mutually exclusive ways to name the customer.
 var customerBindingAttrs = []string{"tenant_id", "azure_tenant_id", "azure_tenant_domain", "azure_subscription_id", "gcp_project_id", "aws_account_id"}
-
-// notBlank rejects whitespace-only values, which would otherwise pass the
-// "set" checks and come back as a confusing 404 from the Hub.
-var notBlank = stringvalidator.RegexMatches(regexp.MustCompile(`\S`), "must not be blank")
-
-// hostNamePattern is a lower-case DNS name with at least two labels and no
-// scheme, port, path or wildcard — what the gateway compares against the
-// host of its base URL. Lower case keeps state and Hub free of case drift.
-var hostNamePattern = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
 // lookups maps each lookup key of GET /tenants/lookup (and of the
 // environment's `lookup` body) to its model field.
@@ -232,16 +222,6 @@ func (m *environmentModel) customerBinding() (lookup map[string]string, tenantID
 		return nil, "", fmt.Errorf("exactly one of %v must be set (got %d)", customerBindingAttrs, n)
 	}
 	return lookup, tenantID, nil
-}
-
-// knownString reports a value that is known and non-empty — i.e. one the
-// user configured (validators already reject blank strings). Null, unknown
-// and "" all count as "not set".
-func knownString(v types.String) (string, bool) {
-	if v.IsNull() || v.IsUnknown() || v.ValueString() == "" {
-		return "", false
-	}
-	return v.ValueString(), true
 }
 
 func (r *environmentResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {

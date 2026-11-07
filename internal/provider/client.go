@@ -53,17 +53,40 @@ func newClient(endpoint, adminKey, version string) *httpClient {
 
 type apiError struct {
 	Status  int
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code    string          `json:"code"`
+	Message string          `json:"message"`
+	Details json.RawMessage `json:"details"`
 }
 
-// Error is always redacted, including the code: the fields come from the
-// wire and are not trusted to be free of secrets.
+// Error is always redacted, including code and details: the fields come
+// from the wire and are not trusted to be free of secrets.
 func (e *apiError) Error() string {
+	msg := fmt.Sprintf("hub api %d", e.Status)
 	if e.Code != "" {
-		return redact(fmt.Sprintf("hub api %d %s: %s", e.Status, e.Code, e.Message))
+		msg += " " + e.Code
 	}
-	return redact(fmt.Sprintf("hub api %d: %s", e.Status, e.Message))
+	msg += ": " + e.Message
+	if d := compactDetails(e.Details); d != "" {
+		msg += " (details: " + d + ")"
+	}
+	return redact(msg)
+}
+
+// compactDetails renders error.details on one line, redacted and then
+// capped like an unstructured body (redacting first means the cap cannot
+// leave an unmatched fragment of a secret behind). The Hub puts the
+// actionable part there, e.g. the editions that exist or the licence that
+// already holds a position.
+func compactDetails(raw json.RawMessage) string {
+	var buf bytes.Buffer
+	if len(raw) == 0 || json.Compact(&buf, raw) != nil || buf.String() == "null" {
+		return ""
+	}
+	s := redact(buf.String())
+	if len(s) > maxBodyForError {
+		s = s[:maxBodyForError] + "…"
+	}
+	return s
 }
 
 // Helper to detect "not found" so callers can map it to RemoveFromState.
@@ -174,6 +197,7 @@ func (c *httpClient) do(ctx context.Context, method, path string, query url.Valu
 		if json.Unmarshal(raw, &env) == nil && env.Error.Code != "" {
 			ae.Code = env.Error.Code
 			ae.Message = redact(env.Error.Message)
+			ae.Details = env.Error.Details
 		} else {
 			// Unstructured body — cap + redact. Avoid raw upstream HTML, proxy
 			// debug pages, etc. leaking the bearer into CI logs.

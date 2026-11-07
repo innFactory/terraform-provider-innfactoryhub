@@ -33,6 +33,9 @@ type fakeHub struct {
 	tenants      []fakeTenant
 	environments map[string]*fakeEnvironment
 	apiKeys      map[string]*fakeAPIKey
+	licenses     map[string]*fakeLicense
+	licenseKeys  []*fakeLicenseKey
+	positions    map[string]*fakePosition
 	calls        []string // "METHOD /path" in arrival order
 	bodies       map[string][]map[string]any
 	nextID       int
@@ -110,6 +113,8 @@ func newFakeHub(t *testing.T) *fakeHub {
 		},
 		environments: map[string]*fakeEnvironment{},
 		apiKeys:      map[string]*fakeAPIKey{},
+		licenses:     map[string]*fakeLicense{},
+		positions:    seededPositions(),
 		bodies:       map[string][]map[string]any{},
 	}
 
@@ -123,6 +128,10 @@ func newFakeHub(t *testing.T) *fakeHub {
 	mux.HandleFunc("GET /api/v1/admin/environments/{id}", h.getEnvironment)
 	mux.HandleFunc("PATCH /api/v1/admin/environments/{id}", h.patchEnvironment)
 	mux.HandleFunc("DELETE /api/v1/admin/environments/{id}", h.deleteEnvironment)
+	mux.HandleFunc("POST /api/v1/admin/licenses", h.createLicense)
+	mux.HandleFunc("GET /api/v1/admin/licenses/{id}", h.getLicense)
+	mux.HandleFunc("PATCH /api/v1/admin/licenses/{id}", h.patchLicense)
+	mux.HandleFunc("DELETE /api/v1/admin/licenses/{id}", h.endLicense)
 
 	h.srv = httptest.NewServer(h.middleware(mux))
 	t.Cleanup(h.srv.Close)
@@ -496,15 +505,28 @@ func (h *fakeHub) patchEnvironment(w http.ResponseWriter, r *http.Request) {
 	writeData(w, http.StatusOK, map[string]any{"environment": *e})
 }
 
+// deleteEnvironment deletes hard, but only without licences that are not
+// ended (409 environment_in_use, details.license_ids) — as the Hub does.
 func (h *fakeHub) deleteEnvironment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	h.mu.Lock()
-	_, ok := h.environments[r.PathValue("id")]
-	delete(h.environments, r.PathValue("id"))
-	h.mu.Unlock()
-	if !ok {
+	defer h.mu.Unlock()
+	if _, ok := h.environments[id]; !ok {
 		writeError(w, http.StatusNotFound, "environment_not_found", "environment not found")
 		return
 	}
+	var inUse []string
+	for _, l := range h.licenses {
+		if l.EnvironmentID == id && l.Status != "ended" {
+			inUse = append(inUse, l.LicenseID)
+		}
+	}
+	if len(inUse) > 0 {
+		(&fakeHTTPError{status: http.StatusConflict, code: "environment_in_use", message: "Umgebung hat laufende Lizenzen",
+			details: map[string]any{"license_ids": inUse}}).write(w)
+		return
+	}
+	delete(h.environments, id)
 	writeData(w, http.StatusOK, map[string]any{"ok": true})
 }
 
