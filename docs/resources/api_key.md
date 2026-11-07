@@ -37,7 +37,7 @@ output "innfactoryhub_api_key" {
 
 - `name` (String) Human-readable name. Multiple keys with the same name per tenant are allowed. Forces replace.
 - `scope` (String) `system` (no tenant binding, read/write allowed) or `organization` (bound to a `tenant_id`, currently read-only). Forces replace.
-- `permissions` (Set of String) Subset of `["read", "write"]`. Organization-scoped keys must request only `["read"]`.
+- `permissions` (Set of String) Subset of `["read", "write"]`. Organization-scoped keys must request only `["read"]`. Forces replace (the Hub cannot edit permissions in place).
 
 ### Optional
 

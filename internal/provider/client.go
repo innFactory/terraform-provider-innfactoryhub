@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-log/tflog"
@@ -23,9 +24,10 @@ import (
 //
 // Authentication: the system-scope `ak_…` key is sent as
 // `Authorization: Bearer ak_<id>.<secret>` exactly as the Hub expects.
-// The key is NEVER logged. Error bodies are redacted before reaching
+// The key is NEVER logged. Error texts are redacted before reaching
 // diagnostics so a misbehaving upstream proxy that echoes the Authorization
-// header into a 502 page cannot leak the bearer into CI logs.
+// header into a 502 page cannot leak the bearer — or a licence key or
+// licence token the Hub returned — into CI logs.
 type httpClient struct {
 	base      string
 	adminKey  string
@@ -38,7 +40,8 @@ func newClient(endpoint, adminKey, version string) *httpClient {
 		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 	}
 	return &httpClient{
-		base:      endpoint,
+		// Tolerate `https://hub.innfactory.ai/` — paths always start with "/".
+		base:      strings.TrimRight(endpoint, "/"),
 		adminKey:  adminKey,
 		userAgent: fmt.Sprintf("terraform-provider-innfactoryhub/%s", version),
 		http: &http.Client{
@@ -54,11 +57,13 @@ type apiError struct {
 	Message string `json:"message"`
 }
 
+// Error is always redacted, including the code: the fields come from the
+// wire and are not trusted to be free of secrets.
 func (e *apiError) Error() string {
 	if e.Code != "" {
-		return fmt.Sprintf("hub api %d %s: %s", e.Status, e.Code, e.Message)
+		return redact(fmt.Sprintf("hub api %d %s: %s", e.Status, e.Code, e.Message))
 	}
-	return fmt.Sprintf("hub api %d: %s", e.Status, e.Message)
+	return redact(fmt.Sprintf("hub api %d: %s", e.Status, e.Message))
 }
 
 // Helper to detect "not found" so callers can map it to RemoveFromState.
@@ -70,18 +75,33 @@ func isNotFound(err error) bool {
 	return false
 }
 
-// Matches the `ak_<id>.<secret>` wire shape so we can strip the bearer from
-// any text we are about to surface as a diagnostic. Conservative: cuts
-// anything that even looks like the prefix, including substrings.
-var akKeyPattern = regexp.MustCompile(`ak_[A-Za-z0-9_-]{1,64}\.[A-Za-z0-9_-]{1,64}`)
+// secretPatterns match every credential shape the provider handles so we
+// can strip them from any text we are about to surface as a diagnostic:
+//   - `ak_<id>.<secret>` — Hub API keys (the provider's own bearer)
+//   - `lk_<id>.<secret>` — AI Hub licence keys
+//   - `eyJ….….…`        — compact JWS (licence, AI-Prices, revocation JWTs)
+//
+// Conservative: cuts anything that even looks like the shape, including
+// substrings, and never caps the length (a capped pattern leaves the tail of
+// a long secret behind). RE2 guarantees linear time on hostile input.
+var secretPatterns = []struct {
+	re   *regexp.Regexp
+	with string
+}{
+	{regexp.MustCompile(`(ak|lk)_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+`), "${1}_***REDACTED***"},
+	{regexp.MustCompile(`eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*`), "***REDACTED_JWT***"},
+}
 
-// redact removes anything that looks like an API key from an arbitrary
+// redact removes anything that looks like a key or token from an arbitrary
 // string. Used before propagating a 4xx/5xx body — a misbehaving reverse
 // proxy or upstream debug page that echoes the request's Authorization
 // header would otherwise put the bearer into a Terraform error message and
 // thus into CI logs.
 func redact(s string) string {
-	return akKeyPattern.ReplaceAllString(s, "ak_***REDACTED***")
+	for _, p := range secretPatterns {
+		s = p.re.ReplaceAllString(s, p.with)
+	}
+	return s
 }
 
 // Cap on how much of an unstructured error body we propagate. 512 bytes is
@@ -89,7 +109,14 @@ func redact(s string) string {
 // debug dumps from leaking through.
 const maxBodyForError = 512
 
+// errMissingAdminKey is returned by every operation when neither
+// provider.admin_key nor INNFACTORYHUB_ADMIN_KEY is set.
+var errMissingAdminKey = errors.New("missing admin key: set provider.admin_key, or export INNFACTORYHUB_ADMIN_KEY with a system-scope key (`ak_…`, permission write) minted in the Hub admin UI")
+
 func (c *httpClient) do(ctx context.Context, method, path string, query url.Values, body, out any) error {
+	if c.adminKey == "" {
+		return errMissingAdminKey
+	}
 	u := c.base + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
@@ -131,7 +158,7 @@ func (c *httpClient) do(ctx context.Context, method, path string, query url.Valu
 
 	raw, err := io.ReadAll(res.Body)
 	if err != nil {
-		return fmt.Errorf("read body: %w", err)
+		return fmt.Errorf("read body: %w", redactErr(err))
 	}
 
 	tflog.Trace(ctx, "hub_response", map[string]any{
@@ -163,7 +190,7 @@ func (c *httpClient) do(ctx context.Context, method, path string, query url.Valu
 		return nil
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
-		return fmt.Errorf("decode response: %w", err)
+		return fmt.Errorf("decode response: %w", redactErr(err))
 	}
 	return nil
 }

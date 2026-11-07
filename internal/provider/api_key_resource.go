@@ -8,6 +8,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
@@ -76,10 +77,11 @@ func (r *apiKeyResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"permissions": schema.SetAttribute{
 				Required:    true,
 				ElementType: types.StringType,
-				Description: "Set of `read` and/or `write`. Organization-scoped keys must request only `read`.",
+				Description: "Set of `read` and/or `write`. Organization-scoped keys must request only `read`. Changing it forces a new key.",
 				PlanModifiers: []planmodifier.Set{
 					// permission changes force replace — the Hub doesn't support
 					// in-place permission edits (would invalidate the hash chain).
+					setplanmodifier.RequiresReplace(),
 				},
 			},
 			"plaintext": schema.StringAttribute{

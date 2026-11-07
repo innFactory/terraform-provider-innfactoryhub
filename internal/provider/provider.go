@@ -39,16 +39,16 @@ type providerModel struct {
 
 func (p *innfactoryhubProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Provider for innFactory Hub — manages reseller API keys and reads tenant identifiers.",
+		Description: "Provider for innFactory Hub (hub.innfactory.cloud) and the innFactory AI Hub (hub.innfactory.ai) — manages API keys and environments and reads tenant identifiers.",
 		Attributes: map[string]schema.Attribute{
 			"endpoint": schema.StringAttribute{
 				Optional:    true,
-				Description: "Base URL of the Hub admin API. Defaults to https://hub.innfactory.cloud. Override via env INNFACTORYHUB_ENDPOINT.",
+				Description: "Base URL of the Hub admin API, e.g. https://hub.innfactory.ai for the innFactory AI Hub. Defaults to https://hub.innfactory.cloud. Must be https on innfactory.cloud, innfactory.ai or a subdomain of either. Override via env INNFACTORYHUB_ENDPOINT.",
 			},
 			"admin_key": schema.StringAttribute{
 				Optional:    true,
 				Sensitive:   true,
-				Description: "System-scope `ak_<id>.<secret>` admin key with `write` permission. Override via env INNFACTORYHUB_ADMIN_KEY (recommended).",
+				Description: "System-scope `ak_<id>.<secret>` admin key with `write` permission. Override via env INNFACTORYHUB_ADMIN_KEY (recommended). Only required once a resource or data source actually calls the Hub, so it may stay empty in plans where every instance is disabled via `count`.",
 			},
 		},
 	}
@@ -64,17 +64,14 @@ func (p *innfactoryhubProvider) Configure(ctx context.Context, req provider.Conf
 	endpoint := strFromAttrOrEnv(data.Endpoint, "INNFACTORYHUB_ENDPOINT", "https://hub.innfactory.cloud")
 	adminKey := strFromAttrOrEnv(data.AdminKey, "INNFACTORYHUB_ADMIN_KEY", "")
 
-	if adminKey == "" {
-		resp.Diagnostics.AddAttributeError(
-			path.Root("admin_key"),
-			"Missing admin key",
-			"Set provider.admin_key, or export INNFACTORYHUB_ADMIN_KEY with a system-scope key minted in the Hub admin UI.",
-		)
-		return
-	}
+	// A missing admin key is NOT an error here: callers such as CompanyGPT
+	// configure the provider in every plan but only read the key from their
+	// secret store when the feature is enabled (count-gated). The client
+	// refuses each request instead, so the error surfaces exactly when an
+	// operation needs the Hub — see errMissingAdminKey.
 
 	// Endpoint hardening: refuse to send the bearer token to anything that
-	// isn't https + the innfactory.cloud trust boundary. Without this, a
+	// isn't https + the innfactory.cloud / innfactory.ai trust boundary. Without this, a
 	// hostile module / typo'd env var / supply-chain compromise could
 	// exfil the admin key to an attacker-controlled host. Operators who
 	// genuinely need a custom endpoint (staging-via-tunnel, local dev) must
@@ -90,33 +87,45 @@ func (p *innfactoryhubProvider) Configure(ctx context.Context, req provider.Conf
 	resp.ResourceData = client
 }
 
-// validateEndpoint enforces https + an innfactory.cloud hostname suffix unless
-// the caller has explicitly opted into insecure mode. Reject `http://`, raw
-// IPs, and arbitrary domains — those are the credential-exfil vectors a
+// trustedDomains are the registrable domains the admin key may be sent to:
+// innfactory.cloud (innfactoryHUB) and innfactory.ai (innFactory AI Hub).
+// Each domain is accepted as apex and with any subdomain — nothing else.
+var trustedDomains = []string{"innfactory.cloud", "innfactory.ai"}
+
+// validateEndpoint enforces https + a trusted hostname unless the caller has
+// explicitly opted into insecure mode. Reject `http://`, raw IPs, and
+// arbitrary domains — those are the credential-exfil vectors a
 // public-registry provider has to defend against.
 func validateEndpoint(raw string, insecure bool) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
 		return errNotAUrl
 	}
-	if u.Scheme != "https" {
-		if !insecure {
-			return errNotHttps
-		}
+	if u.Scheme != "https" && !insecure {
+		return errNotHttps
 	}
-	host := strings.ToLower(u.Hostname())
-	if host == "hub.innfactory.cloud" || strings.HasSuffix(host, ".innfactory.cloud") {
-		return nil
-	}
-	if insecure {
+	if isTrustedHost(u.Hostname()) || insecure {
 		return nil
 	}
 	return errNotInnfactoryHost
 }
 
+// isTrustedHost matches label boundaries, so innfactory.ai.evil.com and
+// evilinnfactory.ai are refused while hub.innfactory.ai is accepted.
+func isTrustedHost(host string) bool {
+	host = strings.ToLower(host)
+	for _, domain := range trustedDomains {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *innfactoryhubProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		newApiKeyResource,
+		newEnvironmentResource,
 	}
 }
 
@@ -129,7 +138,7 @@ func (p *innfactoryhubProvider) DataSources(_ context.Context) []func() datasour
 var (
 	errNotAUrl           = errEndpoint("endpoint is not a valid URL")
 	errNotHttps          = errEndpoint("endpoint must use https:// — set INNFACTORYHUB_INSECURE_ENDPOINT=1 to override for local dev")
-	errNotInnfactoryHost = errEndpoint("endpoint host must be hub.innfactory.cloud or *.innfactory.cloud — set INNFACTORYHUB_INSECURE_ENDPOINT=1 to override for staging-via-tunnel or local dev")
+	errNotInnfactoryHost = errEndpoint("endpoint host must be innfactory.cloud, innfactory.ai or one of their subdomains (e.g. hub.innfactory.cloud, hub.innfactory.ai) — set INNFACTORYHUB_INSECURE_ENDPOINT=1 to override for staging-via-tunnel or local dev")
 )
 
 type errEndpoint string

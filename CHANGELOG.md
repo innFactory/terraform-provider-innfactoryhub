@@ -4,10 +4,26 @@
 
 **Added**
 
+- Resource `innfactoryhub_environment` (innFactory AI Hub): registers a customer installation via `POST /api/v1/admin/environments`, bound by exactly one of `tenant_id`, `azure_tenant_id`, `azure_tenant_domain`, `azure_subscription_id`, `gcp_project_id`, `aws_account_id`. `name` and `domain` update in place (`PATCH`); `cloud` and the customer binding force replacement; import by `environment_id`. Hub errors `tenant_not_found`, `ambiguous_lookup` and `environment_exists` come with a remediation hint.
+- Endpoint allowlist accepts `innfactory.ai` and its subdomains (e.g. `https://hub.innfactory.ai`) besides `innfactory.cloud`; both apexes are accepted too.
+- Test suite: `resource.UnitTest` against an `httptest` fake Hub (create, in-place update, replacement, import, validation, errors, redaction). New dependencies `terraform-plugin-framework-validators` v0.15.0 and `terraform-plugin-testing` v1.11.0.
+
 - Data source `innfactoryhub_tenant` accepts two more inputs: `tenant_id` (direct fetch, no scan) and `azure_tenant_id` (Entra ID directory — distinct from a subscription).
 - `azure_tenant_ids` returned as a computed list attribute.
 
+**Changed**
+
+- A missing admin key no longer fails provider configuration; it fails the first operation that calls the Hub (`missing admin key`). Allows count-gated secret reads in callers such as CompanyGPT.
+- A trailing slash on `endpoint` is tolerated.
+
+**Fixed**
+
+- `innfactoryhub_api_key`: changing `permissions` now forces replacement instead of failing with "Update not supported".
+
 **Security**
+
+- Error redaction also covers licence keys (`lk_…`) and JWTs, applies to the error code and to transport/decode errors, and no longer leaves the tail of secrets longer than 64 characters behind.
+- Look-alike hosts such as `innfactory.ai.evil.com` and `evilinnfactory.ai` are refused (label-boundary match).
 
 - Endpoint host pin: refuses to send the admin key to anything that isn't `https://hub.innfactory.cloud` or `https://*.innfactory.cloud`. Opt-out via `INNFACTORYHUB_INSECURE_ENDPOINT=1` for local dev.
 - 4xx/5xx response bodies are truncated to 512 bytes and stripped of `ak_…` shapes before reaching Terraform diagnostics.
