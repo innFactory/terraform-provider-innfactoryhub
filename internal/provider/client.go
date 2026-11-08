@@ -170,6 +170,11 @@ var errMissingAdminKey = errors.New("missing admin key: set provider.admin_key, 
 	"minted in the Hub admin UI — on the innFactory AI Hub [\"read\", \"licensing\"] to apply and [\"read_licensing\"] for plans, on innfactoryHUB one with write")
 
 func (c *httpClient) do(ctx context.Context, method, path string, query url.Values, body, out any) error {
+	return c.send(ctx, method, path, query, body, out, "")
+}
+
+// send is do with an optional Idempotency-Key (see create).
+func (c *httpClient) send(ctx context.Context, method, path string, query url.Values, body, out any, idempotencyKey string) error {
 	if c.adminKey == "" {
 		return errMissingAdminKey
 	}
@@ -199,6 +204,13 @@ func (c *httpClient) do(ctx context.Context, method, path string, query url.Valu
 	req.Header.Set("Accept", "application/json")
 	if c.auditContext != "" {
 		req.Header.Set("X-Audit-Context", c.auditContext)
+	}
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+		// net/http would silently resend a request with this header after
+		// some connection errors; the resource retries on its own instead,
+		// after looking up what the first attempt may have created.
+		req.GetBody = nil
 	}
 
 	// Log only the path — not the query string — at trace level. The query

@@ -243,8 +243,10 @@ func (r *environmentResource) Create(ctx context.Context, req resource.CreateReq
 		Domain:   plan.Domain.ValueString(),
 		Cloud:    plan.Cloud.ValueString(),
 	}
+	// A lost response is retried with the same Idempotency-Key: the Hub then
+	// returns the environment it registered instead of a second one.
 	var env envelope[environmentResponse]
-	if err := r.client.do(ctx, http.MethodPost, environmentsPath, nil, body, &env); err != nil {
+	if _, err := r.client.create(ctx, environmentsPath, body, &env, nil); err != nil {
 		resp.Diagnostics.AddError("Create environment failed", withHint(err, environmentCreateHints))
 		return
 	}

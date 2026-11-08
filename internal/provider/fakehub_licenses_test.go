@@ -25,6 +25,8 @@ import (
 //   - the plaintext key exists only in the create and rotation responses
 //   - POST …/keys/rotate issues a new key and revokes every earlier one, also
 //     for suspended or expired licences, never for ended ones (409 license_ended)
+//   - POST with an Idempotency-Key seen before (24 h): 409 idempotent_replay
+//     with details.license_id, and never the key again
 
 // Seeded fixtures for licence tests.
 const (
@@ -548,6 +550,16 @@ func (h *fakeHub) createLicense(w http.ResponseWriter, r *http.Request) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	idemKey, herr := fakeIdempotencyKey(r)
+	if herr != nil {
+		herr.write(w)
+		return
+	}
+	if prior, ok := h.idempotency[idemKey]; ok && idemKey != "" {
+		(&fakeHTTPError{status: http.StatusConflict, code: "idempotent_replay", message: "Diese Anlage wurde bereits ausgeführt",
+			details: map[string]any{"license_id": strings.TrimPrefix(prior, "license:")}}).write(w)
+		return
+	}
 	env, ok := h.environments[body.EnvironmentID]
 	if !ok {
 		(&fakeHTTPError{status: http.StatusNotFound, code: "environment_not_found", message: "Umgebung nicht gefunden"}).write(w)
@@ -575,6 +587,9 @@ func (h *fakeHub) createLicense(w http.ResponseWriter, r *http.Request) {
 	l.Params = fakeLicenseParams{Domains: domains, MaxUsers: maxUsers, MaxInstances: maxInstances,
 		EditionID: *p.EditionID, Features: features, Entitlements: entitlements}
 	h.licenses[l.LicenseID] = l
+	if idemKey != "" {
+		h.idempotency[idemKey] = "license:" + l.LicenseID
+	}
 	h.linkPositionLocked(l, nil)
 	key := h.mintLicenseKeyLocked(l.LicenseID)
 	writeData(w, http.StatusCreated, map[string]any{"license": *l, "license_key": key})
@@ -620,6 +635,22 @@ func (h *fakeHub) rotateLicenseKey(w http.ResponseWriter, r *http.Request) {
 	}
 	plaintext, key := h.rotateKeyLocked(l.LicenseID)
 	writeData(w, http.StatusOK, map[string]any{"license_key": plaintext, "key": key})
+}
+
+// listLicenses mirrors GET /licenses?tenant_id=&environment_id=&status=.
+func (h *fakeHub) listLicenses(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := []fakeLicense{}
+	for _, l := range h.licenses {
+		if (q.Get("tenant_id") == "" || q.Get("tenant_id") == l.TenantID) &&
+			(q.Get("environment_id") == "" || q.Get("environment_id") == l.EnvironmentID) &&
+			(q.Get("status") == "" || q.Get("status") == l.Status) {
+			out = append(out, *l)
+		}
+	}
+	writeData(w, http.StatusOK, map[string]any{"licenses": out, "hints": []any{}})
 }
 
 func (h *fakeHub) getLicense(w http.ResponseWriter, r *http.Request) {

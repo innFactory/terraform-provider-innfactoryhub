@@ -52,6 +52,19 @@ type fakeHub struct {
 	errorPath   string
 	errorStatus int
 	errorBody   string
+	// errorTimes limits the injected failure to that many requests (0 =
+	// until cleared).
+	errorTimes int
+	// dropPath: the next dropTimes POSTs whose path ends with dropPath are
+	// processed, but the connection is closed instead of answering — a
+	// response lost in transit.
+	dropPath  string
+	dropTimes int
+	// idempotency maps an Idempotency-Key to what its first request
+	// created ("environment:<id>" or "license:<id>").
+	idempotency map[string]string
+	// idempotencyKeys lists the Idempotency-Key of every call ("" = none).
+	idempotencyKeys []string
 }
 
 type fakeTenant struct {
@@ -113,6 +126,7 @@ func newFakeHub(t *testing.T) *fakeHub {
 		licenses:     map[string]*fakeLicense{},
 		positions:    seededPositions(),
 		bodies:       map[string][]map[string]any{},
+		idempotency:  map[string]string{},
 	}
 
 	mux := http.NewServeMux()
@@ -126,6 +140,7 @@ func newFakeHub(t *testing.T) *fakeHub {
 	mux.HandleFunc("GET /api/v1/admin/environments/{id}", h.getEnvironment)
 	mux.HandleFunc("PATCH /api/v1/admin/environments/{id}", h.patchEnvironment)
 	mux.HandleFunc("DELETE /api/v1/admin/environments/{id}", h.deleteEnvironment)
+	mux.HandleFunc("GET /api/v1/admin/licenses", h.listLicenses)
 	mux.HandleFunc("POST /api/v1/admin/licenses", h.createLicense)
 	mux.HandleFunc("GET /api/v1/admin/licenses/{id}", h.getLicense)
 	mux.HandleFunc("PATCH /api/v1/admin/licenses/{id}", h.patchLicense)
@@ -152,11 +167,21 @@ func (h *fakeHub) middleware(next http.Handler) http.Handler {
 		h.mu.Lock()
 		h.calls = append(h.calls, call)
 		h.audits = append(h.audits, audit)
+		h.idempotencyKeys = append(h.idempotencyKeys, r.Header.Get("Idempotency-Key"))
 		if decoded {
 			h.bodies[call] = append(h.bodies[call], body)
 		}
 		status, errBody := h.errorStatus, h.errorBody
 		failThis := (h.errorMethod == "" || h.errorMethod == r.Method) && strings.HasSuffix(r.URL.Path, h.errorPath)
+		if status != 0 && failThis && h.errorTimes > 0 {
+			if h.errorTimes--; h.errorTimes == 0 {
+				h.errorStatus = 0
+			}
+		}
+		drop := r.Method == http.MethodPost && h.dropTimes > 0 && strings.HasSuffix(r.URL.Path, h.dropPath)
+		if drop {
+			h.dropTimes--
+		}
 		h.mu.Unlock()
 
 		if status != 0 && failThis {
@@ -177,7 +202,15 @@ func (h *fakeHub) middleware(next http.Handler) http.Handler {
 			writeError(w, http.StatusBadRequest, "bad_request", "X-Audit-Context: at most 256 printable ASCII characters")
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), callerKey{}, caller)))
+		r = r.WithContext(context.WithValue(r.Context(), callerKey{}, caller))
+		if drop {
+			next.ServeHTTP(httptest.NewRecorder(), r)
+			if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				_ = conn.Close()
+			}
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -222,7 +255,7 @@ func (h *fakeHub) callCount() int {
 func (h *fakeHub) resetCalls() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.calls, h.audits = nil, nil
+	h.calls, h.audits, h.idempotencyKeys = nil, nil, nil
 }
 
 func (h *fakeHub) lastBody(methodPath string) map[string]any {
@@ -274,6 +307,35 @@ func (h *fakeHub) removeEnvironment(id string) {
 // failAll makes every subsequent request answer with status + raw body.
 func (h *fakeHub) failAll(status int, raw string) { h.failMethod("", status, raw) }
 
+// failTimes fails the next n requests with the given method and path suffix.
+func (h *fakeHub) failTimes(n int, method, suffix string, status int, raw string) {
+	h.failPath(method, suffix, status, raw)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.errorTimes = n
+}
+
+// dropResponses processes the next n POSTs to a path ending with suffix but
+// closes the connection instead of answering.
+func (h *fakeHub) dropResponses(n int, suffix string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.dropPath, h.dropTimes = suffix, n
+}
+
+// idempotencyKeysOf lists the Idempotency-Key of every call to methodPath.
+func (h *fakeHub) idempotencyKeysOf(methodPath string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []string
+	for i, c := range h.calls {
+		if c == methodPath {
+			out = append(out, h.idempotencyKeys[i])
+		}
+	}
+	return out
+}
+
 // failMethod fails only requests with the given method; status 0 clears it.
 func (h *fakeHub) failMethod(method string, status int, raw string) {
 	h.failPath(method, "", status, raw)
@@ -284,7 +346,7 @@ func (h *fakeHub) failMethod(method string, status int, raw string) {
 func (h *fakeHub) failPath(method, suffix string, status int, raw string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.errorMethod, h.errorPath, h.errorStatus, h.errorBody = method, suffix, status, raw
+	h.errorMethod, h.errorPath, h.errorStatus, h.errorBody, h.errorTimes = method, suffix, status, raw, 0
 }
 
 // --- handlers (callers do NOT hold mu) ---
@@ -404,6 +466,16 @@ func (h *fakeHub) createEnvironment(w http.ResponseWriter, r *http.Request) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	idemKey, herr := fakeIdempotencyKey(r)
+	if herr != nil {
+		herr.write(w)
+		return
+	}
+	if prior, ok := h.idempotency[idemKey]; ok && idemKey != "" {
+		// Replay: the same environment, nothing new.
+		writeData(w, http.StatusOK, map[string]any{"environment": *h.environments[strings.TrimPrefix(prior, "environment:")]})
+		return
+	}
 	t, status, code := h.resolveTenant(used.Type, used.Value)
 	if status != 0 {
 		writeError(w, status, code, "no unique customer for "+used.Type)
@@ -423,6 +495,9 @@ func (h *fakeHub) createEnvironment(w http.ResponseWriter, r *http.Request) {
 		CreatedBy: "terraform", CreatedAt: now, UpdatedAt: now,
 	}
 	h.environments[e.EnvironmentID] = e
+	if idemKey != "" {
+		h.idempotency[idemKey] = "environment:" + e.EnvironmentID
+	}
 	writeData(w, http.StatusCreated, map[string]any{"environment": *e})
 }
 
@@ -494,6 +569,18 @@ func (h *fakeHub) deleteEnvironment(w http.ResponseWriter, r *http.Request) {
 	}
 	delete(h.environments, id)
 	writeData(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// fakeUUID is the Hub's check of Idempotency-Key (a UUID, RFC 9562 variant).
+var fakeUUID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// fakeIdempotencyKey reads the optional Idempotency-Key ("" = none).
+func fakeIdempotencyKey(r *http.Request) (string, *fakeHTTPError) {
+	k := r.Header.Get("Idempotency-Key")
+	if k != "" && !fakeUUID.MatchString(k) {
+		return "", badRequest("Idempotency-Key must be a UUID")
+	}
+	return k, nil
 }
 
 // --- wire helpers ---
