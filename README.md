@@ -127,7 +127,7 @@ For local debugging, run `./terraform-provider-innfactoryhub --debug` and follow
 
 ## Releases
 
-Tagged via `git tag v0.2.0 && git push origin v0.2.0` — a manual step after approval. The `Release` workflow runs in the protected `release` environment: GoReleaser v2.19.0 (pinned) cross-compiles for darwin/linux/windows/freebsd, signs the checksum file with GPG and publishes to GitHub Releases; `actions/attest-build-provenance` attests the zips and the checksum file. The public Terraform Registry polls the releases page. Every action is pinned to a commit SHA; Dependabot proposes updates weekly.
+Tagged via `git tag v0.2.0 && git push origin v0.2.0` — a manual step after approval, on a commit that is already on `main`. The `Release` workflow first runs a gate (`verify`): the tagged commit must be on `main`, the Go toolchain in use must be the one `go.mod` pins, and `go mod verify`, `go vet`, `go test -race` and govulncheck must pass. Only then the release job runs in the protected `release` environment: GoReleaser v2.19.0 (pinned) cross-compiles for darwin/linux/windows/freebsd, signs the checksum file with GPG and publishes to GitHub Releases; `actions/attest-build-provenance` attests the zips and the checksum file. The public Terraform Registry polls the releases page. Every action is pinned to a commit SHA; Dependabot proposes updates weekly.
 
 Verify a release binary's provenance:
 
