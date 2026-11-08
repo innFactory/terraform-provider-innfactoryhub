@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
@@ -31,6 +32,7 @@ var (
 	_ resource.ResourceWithConfigure        = (*licenseResource)(nil)
 	_ resource.ResourceWithConfigValidators = (*licenseResource)(nil)
 	_ resource.ResourceWithImportState      = (*licenseResource)(nil)
+	_ resource.ResourceWithModifyPlan       = (*licenseResource)(nil)
 )
 
 // licensesPath is served by the AI Hub's licence API behind
@@ -38,8 +40,9 @@ var (
 const licensesPath = "/api/v1/admin/licenses"
 
 // licenseResource issues a licence for an environment in the AI Hub. The
-// Hub returns the licence key (`lk_…`) exactly once, in the create response;
-// it is kept in state and never read back.
+// Hub returns the licence key (`lk_…`) only in the create and rotation
+// responses; it is kept in state and never read back. Read tracks whether
+// that key is still the licence's key (key_id, key_status).
 type licenseResource struct {
 	client *httpClient
 }
@@ -64,12 +67,21 @@ type licenseModel struct {
 	UnbilledMaxUntil   types.String `tfsdk:"unbilled_max_until"`
 	RotationTrigger    types.String `tfsdk:"rotation_trigger"`
 	LicenseKey         types.String `tfsdk:"license_key"`
+	KeyID              types.String `tfsdk:"key_id"`
+	KeyStatus          types.String `tfsdk:"key_status"`
 	TenantID           types.String `tfsdk:"tenant_id"`
 	Status             types.String `tfsdk:"status"`
 	ValidUntil         types.String `tfsdk:"valid_until"`
 }
 
 const licenseStatusEnded = "ended"
+
+// key_status values: the key in state is the licence's current key, or the
+// Hub revoked it (e.g. rotated in the portal).
+const (
+	keyStatusActive  = "active"
+	keyStatusRevoked = "revoked"
+)
 
 // Values the Hub accepts (OpenAPI LicenseCreateBody).
 var (
@@ -184,16 +196,27 @@ func (r *licenseResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			},
 			"rotation_trigger": schema.StringAttribute{
 				Optional: true,
-				Description: "Rotates the licence key: any change (including setting or removing it) replaces the licence — " +
-					"the current one is ended and a new one with a new key is issued. The Hub returns a key only when it issues a licence.",
-				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
+				Description: "Rotates the licence key: any change (including setting or removing it) rotates the key of the same licence in place " +
+					"(`POST …/keys/rotate`) — the previous key is revoked at once, the new one lands in `license_key`; licence id, instances " +
+					"and contract position stay. For a licence ended in the Hub, a change issues a new licence instead.",
 			},
 			"license_key": schema.StringAttribute{
 				Computed:    true,
 				Sensitive:   true,
-				Description: "Licence key (`lk_<id>.<secret>`). Returned by the Hub only when the licence is issued.",
+				Description: "Licence key (`lk_<id>.<secret>`). Returned by the Hub only when the licence is issued or its key rotated; empty after import.",
 				// The Hub never returns the key again: without this, every
 				// update would plan it as unknown and lose it.
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+			},
+			"key_id": schema.StringAttribute{
+				Computed:      true,
+				Description:   "Id of the key in `license_key` (the `<id>` of `lk_<id>.<secret>`); empty when state holds no key (after import).",
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+			},
+			"key_status": schema.StringAttribute{
+				Computed: true,
+				Description: "`active` while `license_key` is the licence's current key; `revoked` once the Hub revoked it, e.g. after a rotation in the portal — " +
+					"plans then fail until `rotation_trigger` changes. Empty when state holds no key.",
 				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
 			"tenant_id": schema.StringAttribute{
@@ -202,8 +225,9 @@ func (r *licenseResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
 			"status": schema.StringAttribute{
-				Computed:    true,
-				Description: "`active`, `suspended` or `expired`.",
+				Computed: true,
+				Description: "`active`, `suspended`, `expired` or `ended`. Terraform never changes it: a licence suspended or ended in the Hub stays so; " +
+					"for an ended one, plans fail until `rotation_trigger` changes (which issues a new licence).",
 			},
 			"valid_until": schema.StringAttribute{
 				Computed:    true,
@@ -312,8 +336,22 @@ type licenseDTO struct {
 	Status             string           `json:"status"`
 }
 
+// licenseKeyInfo is LicenseKeyInfo without the fields the provider ignores.
+type licenseKeyInfo struct {
+	KeyID     string  `json:"key_id"`
+	RevokedAt *string `json:"revoked_at"`
+}
+
+// licenseResponse is the body of GET and PATCH; only GET carries keys.
 type licenseResponse struct {
-	License licenseDTO `json:"license"`
+	License licenseDTO       `json:"license"`
+	Keys    []licenseKeyInfo `json:"keys"`
+}
+
+// licenseKeyRotation is the body of POST …/keys/rotate.
+type licenseKeyRotation struct {
+	LicenseKey string         `json:"license_key"`
+	Key        licenseKeyInfo `json:"key"`
 }
 
 type licenseCreateResponse struct {
@@ -367,7 +405,8 @@ var licenseHints = map[string]string{
 	"invalid_domain":            "details.domains lists the rejected entries. Use host names such as gpt.example.com or *.example.com.",
 	"unbilled_max_exceeded":     "unbilled_max_until is beyond the limit in details.max_until_limit: trial at most 60 days, partner and internal at most 12 months from today.",
 	"unbilled_max_in_past":      "unbilled_max_until must be today or later.",
-	"license_ended":             "The licence was ended in the Hub. Run terraform apply again: the refresh drops it and a new licence is issued.",
+	"license_ended": "The licence was ended in the AI Hub. Terraform does not re-issue it on its own: change rotation_trigger to issue a new licence, " +
+		"or remove the resource from the configuration.",
 }
 
 func licensePath(id string) string {
@@ -416,6 +455,54 @@ func (m *licenseModel) billingLink() (position string, unbilled *licenseUnbilled
 		return "", &licenseUnbilled{Reason: reason, MaxUntil: maxUntil}
 	}
 	return "", nil
+}
+
+// setKey stores a key the Hub just returned, with its id; the key is then
+// the licence's current one.
+func (m *licenseModel) setKey(plaintext, keyID string) {
+	m.LicenseKey = types.StringValue(plaintext)
+	m.KeyID, m.KeyStatus = types.StringNull(), types.StringNull()
+	if keyID != "" {
+		m.KeyID, m.KeyStatus = types.StringValue(keyID), types.StringValue(keyStatusActive)
+	}
+}
+
+// licenseKeyID is the `<id>` of `lk_<id>.<secret>` ("" for another shape).
+func licenseKeyID(plaintext string) string {
+	rest, ok := strings.CutPrefix(plaintext, "lk_")
+	if !ok {
+		return ""
+	}
+	id, _, ok := strings.Cut(rest, ".")
+	if !ok {
+		return ""
+	}
+	return id
+}
+
+// trackKey records whether the key in state is still the licence's current
+// key. keys == nil means the Hub reported none: what is known stays.
+func (m *licenseModel) trackKey(keys []licenseKeyInfo) {
+	if _, ok := knownString(m.KeyID); !ok {
+		// State written before key_id existed: derive it from the key.
+		if id := licenseKeyID(m.LicenseKey.ValueString()); id != "" {
+			m.KeyID = types.StringValue(id)
+		}
+	}
+	id, ok := knownString(m.KeyID)
+	if !ok {
+		m.KeyID, m.KeyStatus = types.StringNull(), types.StringNull()
+		return
+	}
+	if keys == nil {
+		return
+	}
+	m.KeyStatus = types.StringValue(keyStatusRevoked)
+	for _, k := range keys {
+		if k.KeyID == id && k.RevokedAt == nil {
+			m.KeyStatus = types.StringValue(keyStatusActive)
+		}
+	}
 }
 
 // fillComputed copies what only the Hub knows into a planned model:
@@ -478,7 +565,7 @@ func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest
 	}
 
 	plan.fillComputed(ctx, &resp.Diagnostics, env.Data.License)
-	plan.LicenseKey = types.StringValue(env.Data.LicenseKey)
+	plan.setKey(env.Data.LicenseKey, licenseKeyID(env.Data.LicenseKey))
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
@@ -491,24 +578,72 @@ func (r *licenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 
 	var env envelope[licenseResponse]
 	err := r.client.do(ctx, http.MethodGet, licensePath(state.ID.ValueString()), nil, nil, &env)
-	// An ended licence stays in the Hub as history but can no longer be
-	// changed (409 license_ended): treat it like a missing one, so Terraform
-	// plans a new licence.
-	if isNotFound(err) || (err == nil && env.Data.License.Status == licenseStatusEnded) {
+	// The Hub never deletes a licence; 404 means another Hub or lost data.
+	if isNotFound(err) {
 		resp.State.RemoveResource(ctx)
 		return
 	}
 	if err != nil {
-		resp.Diagnostics.AddError("Read licence failed", err.Error())
+		resp.Diagnostics.AddError("Read licence failed", withHint(err, licenseHints))
 		return
 	}
 
+	// An ended licence stays in state with status "ended" — dropping it would
+	// re-issue it on the next apply and undo the Hub's decision (SEC-006).
+	// ModifyPlan refuses to plan it until rotation_trigger changes.
 	state.applyRemote(ctx, &resp.Diagnostics, env.Data.License)
+	state.trackKey(env.Data.Keys)
 	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
 }
 
+// ModifyPlan keeps the Hub's revocations: a licence ended or a key revoked
+// in the Hub is not replaced behind the operator's back. Only a
+// rotation_trigger change acts on them — a new licence for an ended one, an
+// in-place key rotation otherwise.
+func (r *licenseResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
+		return // create or destroy
+	}
+	var state, plan licenseModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	resp.Diagnostics.Append(resp.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	rotate := !plan.RotationTrigger.Equal(state.RotationTrigger)
+	trigger := path.Root("rotation_trigger")
+
+	switch {
+	case state.Status.ValueString() == licenseStatusEnded && rotate:
+		resp.RequiresReplace = append(resp.RequiresReplace, trigger)
+	case state.Status.ValueString() == licenseStatusEnded:
+		resp.Diagnostics.AddAttributeError(trigger, "Licence ended in the AI Hub – change rotation_trigger to issue a new one",
+			fmt.Sprintf("Licence %s was ended in the AI Hub (e.g. in the portal). Terraform does not undo that on its own. "+
+				"To issue a new licence with a new key, change rotation_trigger; to retire it, remove the resource from the configuration.",
+				state.ID.ValueString()))
+	case state.KeyStatus.ValueString() == keyStatusRevoked && !rotate:
+		resp.Diagnostics.AddAttributeError(trigger, "Licence key revoked in the AI Hub – change rotation_trigger to issue a new key",
+			fmt.Sprintf("The licence key in state (key %s of licence %s) was revoked in the AI Hub, e.g. because it was rotated in the portal. "+
+				"Terraform does not hand out the revoked key and does not rotate on its own: change rotation_trigger to rotate the key "+
+				"of the same licence in place and store the new key.", state.KeyID.ValueString(), state.ID.ValueString()))
+	case rotate:
+		planKey(ctx, resp, types.StringUnknown(), types.StringUnknown(), types.StringValue(keyStatusActive))
+	default:
+		// No rotation: the key stays as it is, including "no key" after import.
+		planKey(ctx, resp, state.LicenseKey, state.KeyID, state.KeyStatus)
+	}
+}
+
+// planKey plans the key attributes.
+func planKey(ctx context.Context, resp *resource.ModifyPlanResponse, key, id, status types.String) {
+	for name, v := range map[string]types.String{"license_key": key, "key_id": id, "key_status": status} {
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root(name), v)...)
+	}
+}
+
 // Update changes parameters and billing link in place with one PATCH that
-// carries only what changed. The licence key stays as issued.
+// carries only what changed, then — if rotation_trigger changed — rotates
+// the key of the same licence. Without a rotation the key stays as issued.
 func (r *licenseResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan, state licenseModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -521,19 +656,40 @@ func (r *licenseResource) Update(ctx context.Context, req resource.UpdateRequest
 		return
 	}
 
-	// Unchanged parameters and billing link are not sent; an empty PATCH is
-	// a no-op in the Hub (no write, no new revision).
+	// Unchanged parameters and billing link are not sent. With nothing to
+	// change (a pure rotation) the licence is only read for its status.
+	id := state.ID.ValueString()
 	var env envelope[licenseResponse]
-	if err := r.client.do(ctx, http.MethodPatch, licensePath(state.ID.ValueString()), nil, body, &env); err != nil {
+	var err error
+	if body.isEmpty() {
+		err = r.client.do(ctx, http.MethodGet, licensePath(id), nil, nil, &env)
+	} else {
+		err = r.client.do(ctx, http.MethodPatch, licensePath(id), nil, body, &env)
+	}
+	if err != nil {
 		resp.Diagnostics.AddError("Update licence failed", withHint(err, licenseHints))
 		return
 	}
-
 	plan.fillComputed(ctx, &resp.Diagnostics, env.Data.License)
-	// UseStateForUnknown carries the key over, but not a null one: after
-	// import the plan holds it as unknown, and it must stay null.
-	plan.LicenseKey = state.LicenseKey
+	plan.LicenseKey, plan.KeyID, plan.KeyStatus = state.LicenseKey, state.KeyID, state.KeyStatus
+
+	if !plan.RotationTrigger.Equal(state.RotationTrigger) {
+		var rot envelope[licenseKeyRotation]
+		if err := r.client.do(ctx, http.MethodPost, licensePath(id)+"/keys/rotate", nil, struct{}{}, &rot); err != nil {
+			// Keep the update, not the rotation: the previous key and trigger
+			// stay in state, so the next apply retries the rotation.
+			plan.RotationTrigger = state.RotationTrigger
+			resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+			resp.Diagnostics.AddError("Rotate licence key failed", withHint(err, licenseHints))
+			return
+		}
+		plan.setKey(rot.Data.LicenseKey, rot.Data.Key.KeyID)
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+}
+
+func (b licensePatchBody) isEmpty() bool {
+	return len(b.Params) == 0 && b.ContractPositionID == "" && b.Unbilled == nil
 }
 
 // patchBody diffs plan against state: changed params, and the billing link
@@ -610,7 +766,7 @@ func (r *licenseResource) ImportState(ctx context.Context, req resource.ImportSt
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
 	resp.Diagnostics.AddWarning(
 		"Licence key not recoverable on import",
-		"The Hub returns the licence key only when it issues a licence, so license_key is empty after import. "+
-			"To get a key into state, set or change rotation_trigger: that ends this licence and issues a new one with a new key.",
+		"The Hub returns a licence key only when it issues the licence or rotates its key, so license_key is empty after import. "+
+			"To get a key into state, set or change rotation_trigger: that rotates the key of this licence in place (the previous key is revoked).",
 	)
 }

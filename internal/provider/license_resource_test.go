@@ -703,48 +703,6 @@ func TestLicenseReplacement(t *testing.T) {
 	}
 }
 
-// The Hub returns a key only when it issues a licence, so rotating the key
-// means replacing the licence. Any change of rotation_trigger does that;
-// keeping it unchanged keeps licence and key.
-func TestLicenseRotationTriggerIssuesNewKey(t *testing.T) {
-	hub := newLicenseHub(t)
-	useFakeHubEnv(t)
-	withTrigger := func(v string) string {
-		return licenseConfig(hub, gatewayLicense().with(licenseAttrs{"rotation_trigger": fmt.Sprintf("%q", v)}))
-	}
-	replaces := resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
-		plancheck.ExpectResourceAction(licAddr, plancheck.ResourceActionDestroyBeforeCreate),
-	}}
-
-	var id, key string
-	resource.UnitTest(t, resource.TestCase{
-		ProtoV6ProviderFactories: testProviderFactories(),
-		CheckDestroy:             checkLicensesEnded(hub),
-		Steps: []resource.TestStep{
-			{
-				Config: licenseConfig(hub, gatewayLicense()),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					captureAttr(licAddr, "id", &id),
-					captureAttr(licAddr, "license_key", &key),
-				),
-			},
-			{Config: withTrigger("2026-11"), ConfigPlanChecks: replaces, Check: checkReplaced(hub, &id, &key)},
-			{
-				Config:           withTrigger("2026-11"),
-				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}},
-			},
-			{
-				Config:           withTrigger("2026-12"),
-				ConfigPlanChecks: replaces,
-				Check: resource.ComposeAggregateTestCheckFunc(
-					checkReplaced(hub, &id, &key),
-					resource.TestCheckResourceAttr(licAddr, "rotation_trigger", "2026-12"),
-				),
-			},
-		},
-	})
-}
-
 // The rollout lifecycle: create, raise the user limit in place (key stays),
 // then import the licence by id. Everything but the key round-trips; the Hub
 // never returns the key again, so it is empty after import.
@@ -776,7 +734,7 @@ func TestLicenseLifecycleCreateUpdateImport(t *testing.T) {
 				ResourceName:            licAddr,
 				ImportState:             true,
 				ImportStateVerify:       true,
-				ImportStateVerifyIgnore: []string{"license_key"},
+				ImportStateVerifyIgnore: []string{"license_key", "key_id", "key_status"},
 				ImportStateCheck: func(states []*terraform.InstanceState) error {
 					if len(states) != 1 {
 						return fmt.Errorf("expected one imported instance, got %d", len(states))
@@ -792,8 +750,8 @@ func TestLicenseLifecycleCreateUpdateImport(t *testing.T) {
 }
 
 // A licence an admin issued in the portal is adopted by import; the next
-// plan is empty. Its key is unknown to Terraform until rotation_trigger
-// issues a new one.
+// plan is empty. Its key is unknown to Terraform until a rotation_trigger
+// change rotates the key of the same licence.
 func TestLicenseImportPortalCreatedThenRotate(t *testing.T) {
 	hub := newLicenseHub(t)
 	useFakeHubEnv(t)
@@ -827,6 +785,7 @@ func TestLicenseImportPortalCreatedThenRotate(t *testing.T) {
 						"max_users": "50", "unlimited": "false", "max_instances": "5", "edition": "all",
 						"unbilled_reason": "trial", "unbilled_max_until": trialEnd, "valid_until": trialEnd,
 						"features.#": fmt.Sprint(len(allGatewayFeatures)), "domains.#": "1", "license_key": "",
+						"key_id": "", "key_status": "", "status": "active",
 					}
 					for k, v := range want {
 						if a[k] != v {
@@ -847,14 +806,11 @@ func TestLicenseImportPortalCreatedThenRotate(t *testing.T) {
 				},
 			},
 			{
-				Config: licenseConfig(hub, trial.with(licenseAttrs{"rotation_trigger": `"after-import"`})),
-				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
-					plancheck.ExpectResourceAction(licAddr, plancheck.ResourceActionDestroyBeforeCreate),
-				}},
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttrSet(licAddr, "license_key"),
-					checkReplaced(hub, &oldID, &oldKey),
-				),
+				// Rotation is the way to a key after import: same licence, new key.
+				PreConfig:        hub.resetCalls,
+				Config:           licenseConfig(hub, trial.with(licenseAttrs{"rotation_trigger": `"after-import"`})),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: expectRotationInPlace()},
+				Check:            checkRotatedInPlace(hub, &oldID, &oldKey, false),
 			},
 		},
 	})
@@ -953,55 +909,6 @@ func TestLicenseDestroyToleratesUnknownLicense(t *testing.T) {
 			},
 		},
 	})
-}
-
-// A licence ended (in the portal) or gone outside Terraform is dropped from
-// state on refresh and planned for re-issue — PATCHing it would only fail
-// with 409 license_ended.
-func TestLicenseEndedOutsideTerraformIsReissued(t *testing.T) {
-	cases := []struct {
-		name   string
-		remove func(hub *fakeHub, id string)
-	}{
-		{name: "ended in the portal", remove: (*fakeHub).endLicenseOutOfBand},
-		{name: "unknown to the Hub", remove: (*fakeHub).forgetLicense},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			hub := newLicenseHub(t)
-			useFakeHubEnv(t)
-			cfg := licenseConfig(hub, gatewayLicense())
-
-			var id, key string
-			resource.UnitTest(t, resource.TestCase{
-				ProtoV6ProviderFactories: testProviderFactories(),
-				CheckDestroy:             checkLicensesEnded(hub),
-				Steps: []resource.TestStep{
-					{
-						Config: cfg,
-						Check: resource.ComposeAggregateTestCheckFunc(
-							captureAttr(licAddr, "id", &id),
-							captureAttr(licAddr, "license_key", &key),
-							func(*terraform.State) error { tc.remove(hub, id); return nil },
-						),
-						ExpectNonEmptyPlan: true,
-					},
-					{
-						Config: cfg,
-						ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
-							plancheck.ExpectResourceAction(licAddr, plancheck.ResourceActionCreate),
-						}},
-						Check: func(s *terraform.State) error {
-							if stateAttr(s, "id") == id || stateAttr(s, "license_key") == key {
-								return fmt.Errorf("expected a newly issued licence and key")
-							}
-							return nil
-						},
-					},
-				},
-			})
-		})
-	}
 }
 
 // Hub rejections surface their code, the Hub's details and a hint on how to
@@ -1300,6 +1207,8 @@ func TestLicenseImportedLicenseUpdatesInPlace(t *testing.T) {
 					resource.TestCheckResourceAttr(licAddr, "id", "lic_portal000002"),
 					resource.TestCheckResourceAttr(licAddr, "max_users", "120"),
 					resource.TestCheckNoResourceAttr(licAddr, "license_key"),
+					resource.TestCheckNoResourceAttr(licAddr, "key_id"),
+					resource.TestCheckNoResourceAttr(licAddr, "key_status"),
 				),
 			},
 		},
