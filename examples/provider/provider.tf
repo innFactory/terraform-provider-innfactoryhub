@@ -2,7 +2,7 @@ terraform {
   required_providers {
     innfactoryhub = {
       source  = "innfactory/innfactoryhub"
-      version = "~> 0.2"
+      version = "~> 0.2.0"
     }
   }
 }

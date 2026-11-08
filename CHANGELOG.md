@@ -25,6 +25,8 @@ Prepared for release; the tag `v0.2.0` is pushed manually after approval (GoRele
 
 - A missing admin key no longer fails provider configuration; it fails the first operation that calls the Hub (`missing admin key`). Allows count-gated secret reads in callers such as CompanyGPT.
 - A trailing slash on `endpoint` is tolerated.
+- Release binaries are built with Go 1.26.8 (`toolchain` in `go.mod`; Go 1.22 is out of support). Same 13 platforms as v0.1.0; `windows/arm` is excluded explicitly.
+- Docs: `innfactoryhub_api_key` against the AI Hub (organization keys; system keys there expire after 12 months), import example; examples pin `~> 0.2.0`.
 
 **Fixed**
 

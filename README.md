@@ -13,7 +13,7 @@ terraform {
   required_providers {
     innfactoryhub = {
       source  = "innfactory/innfactoryhub"
-      version = "~> 0.2"
+      version = "~> 0.2.0"
     }
   }
 }
@@ -112,7 +112,7 @@ Tagged via `git tag v0.2.0 && git push --tags` — a manual step after approval.
 
 ## Keeping the provider in sync with the Hub API
 
-The Hub repo runs `pnpm openapi:check` in CI which fails when [`docs/api/openapi.json`](https://github.com/innFactory/innfactoryHUB/blob/main/docs/api/openapi.json) drifts from `openapi-spec.ts`. When the spec changes in a way that affects this provider:
+Both hub repos run `pnpm openapi:check` in CI, which fails when `docs/api/openapi.json` drifts from `openapi-spec.ts`: [innfactoryHUB](https://github.com/innFactory/innfactoryHUB/blob/main/docs/api/openapi.json) (tenants, API keys) and innfactoryAIHUB (`docs/api/openapi.json`: tenants, API keys, `/api/v1/admin/environments`, `/api/v1/admin/licenses`). When either spec changes in a way that affects this provider:
 
 1. Re-read the diff in `docs/api/openapi.json`.
 2. Update the relevant resource/data-source shape here.
