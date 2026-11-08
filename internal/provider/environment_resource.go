@@ -269,7 +269,7 @@ func (r *environmentResource) Read(ctx context.Context, req resource.ReadRequest
 
 	var env envelope[environmentResponse]
 	err := r.client.do(ctx, http.MethodGet, environmentPath(state.ID.ValueString()), nil, nil, &env)
-	if isNotFound(err) {
+	if isHubNotFound(err, codeEnvironmentNotFound) {
 		resp.State.RemoveResource(ctx)
 		return
 	}
@@ -338,7 +338,7 @@ func (r *environmentResource) Delete(ctx context.Context, req resource.DeleteReq
 		return
 	}
 	err := r.client.do(ctx, http.MethodDelete, environmentPath(state.ID.ValueString()), nil, nil, nil)
-	if err != nil && !isNotFound(err) {
+	if err != nil && !isHubNotFound(err, codeEnvironmentNotFound) {
 		resp.Diagnostics.AddError("Delete environment failed", withHint(err, environmentCreateHints))
 	}
 }

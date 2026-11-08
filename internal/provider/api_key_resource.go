@@ -480,7 +480,7 @@ func (r *apiKeyResource) Delete(ctx context.Context, req resource.DeleteRequest,
 	}
 	// Revoking is idempotent in both hubs; a key already gone counts as revoked.
 	err := r.client.do(ctx, http.MethodPost, apiKeysPath+"/"+url.PathEscape(id)+"/revoke", nil, struct{}{}, nil)
-	if err != nil && !isNotFound(err) {
+	if err != nil && !isHubNotFound(err, codeAPIKeyNotFound) {
 		resp.Diagnostics.AddError("Revoke API key failed", withHint(err, apiKeyHints))
 	}
 }

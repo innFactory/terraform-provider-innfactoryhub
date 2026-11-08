@@ -121,13 +121,21 @@ func compactDetails(raw json.RawMessage) string {
 	return s
 }
 
-// Helper to detect "not found" so callers can map it to RemoveFromState.
-func isNotFound(err error) bool {
+// Hub error codes that say the object itself does not exist. Only these
+// drop a resource from state: any other 404 (a proxy page, a wrong path,
+// another service) is an error, or the next apply would create the object a
+// second time.
+const (
+	codeLicenseNotFound     = "license_not_found"
+	codeEnvironmentNotFound = "environment_not_found"
+	codeAPIKeyNotFound      = "api_key_not_found"
+)
+
+// isHubNotFound reports a 404 carrying the Hub's own "not found" code for
+// the object, e.g. license_not_found.
+func isHubNotFound(err error, code string) bool {
 	var ae *apiError
-	if errors.As(err, &ae) {
-		return ae.Status == http.StatusNotFound
-	}
-	return false
+	return errors.As(err, &ae) && ae.Status == http.StatusNotFound && ae.Code == code
 }
 
 // secretPatterns match every credential shape the provider handles so we

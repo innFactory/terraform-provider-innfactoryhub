@@ -677,8 +677,9 @@ func (r *licenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 
 	var env envelope[licenseResponse]
 	err := r.client.do(ctx, http.MethodGet, licensePath(state.ID.ValueString()), nil, nil, &env)
-	// The Hub never deletes a licence; 404 means another Hub or lost data.
-	if isNotFound(err) {
+	// The Hub never deletes a licence; license_not_found means another Hub
+	// or lost data. A foreign 404 is an error (see isHubNotFound).
+	if isHubNotFound(err, codeLicenseNotFound) {
 		resp.State.RemoveResource(ctx)
 		return
 	}
@@ -854,7 +855,7 @@ func (r *licenseResource) Delete(ctx context.Context, req resource.DeleteRequest
 		return
 	}
 	err := r.client.do(ctx, http.MethodDelete, licensePath(state.ID.ValueString()), nil, nil, nil)
-	if err != nil && !isNotFound(err) {
+	if err != nil && !isHubNotFound(err, codeLicenseNotFound) {
 		resp.Diagnostics.AddError("End licence failed", withHint(err, licenseHints))
 	}
 }
