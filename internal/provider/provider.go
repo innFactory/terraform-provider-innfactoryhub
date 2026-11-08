@@ -2,8 +2,10 @@ package provider
 
 import (
 	"context"
+	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -33,8 +35,9 @@ func (p *innfactoryhubProvider) Metadata(_ context.Context, _ provider.MetadataR
 }
 
 type providerModel struct {
-	Endpoint types.String `tfsdk:"endpoint"`
-	AdminKey types.String `tfsdk:"admin_key"`
+	Endpoint     types.String `tfsdk:"endpoint"`
+	AdminKey     types.String `tfsdk:"admin_key"`
+	AuditContext types.String `tfsdk:"audit_context"`
 }
 
 func (p *innfactoryhubProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
@@ -43,12 +46,20 @@ func (p *innfactoryhubProvider) Schema(_ context.Context, _ provider.SchemaReque
 		Attributes: map[string]schema.Attribute{
 			"endpoint": schema.StringAttribute{
 				Optional:    true,
-				Description: "Base URL of the Hub admin API, e.g. https://hub.innfactory.ai for the innFactory AI Hub. Defaults to https://hub.innfactory.cloud. Must be https on innfactory.cloud, innfactory.ai or a subdomain of either. Override via env INNFACTORYHUB_ENDPOINT.",
+				Description: "Base URL of the Hub admin API: https://hub.innfactory.ai (innFactory AI Hub) or https://hub.innfactory.cloud (innfactoryHUB, the default). No other host is accepted unless INNFACTORYHUB_INSECURE_ENDPOINT=1 is set (local development). Override via env INNFACTORYHUB_ENDPOINT.",
 			},
 			"admin_key": schema.StringAttribute{
-				Optional:    true,
-				Sensitive:   true,
-				Description: "System-scope `ak_<id>.<secret>` admin key with `write` permission. Override via env INNFACTORYHUB_ADMIN_KEY (recommended). Only required once a resource or data source actually calls the Hub, so it may stay empty in plans where every instance is disabled via `count`.",
+				Optional:  true,
+				Sensitive: true,
+				Description: "System-scope `ak_<id>.<secret>` key. On the innFactory AI Hub use permissions `[\"read\", \"licensing\"]` to apply " +
+					"and `[\"read_licensing\"]` (read-only) for plans, e.g. in pull requests; on innfactoryHUB a key with `write`. " +
+					"Override via env INNFACTORYHUB_ADMIN_KEY (recommended). Only required once a resource or data source actually calls the Hub, " +
+					"so it may stay empty in plans where every instance is disabled via `count`.",
+			},
+			"audit_context": schema.StringAttribute{
+				Optional: true,
+				Description: "Free text the Hub stores with every change in its audit log (header `X-Audit-Context`), e.g. the CI run URL, commit and customer. " +
+					"Sanitised to at most 256 printable ASCII characters on one line. Override via env INNFACTORYHUB_AUDIT_CONTEXT.",
 			},
 		},
 	}
@@ -70,12 +81,12 @@ func (p *innfactoryhubProvider) Configure(ctx context.Context, req provider.Conf
 	// refuses each request instead, so the error surfaces exactly when an
 	// operation needs the Hub — see errMissingAdminKey.
 
-	// Endpoint hardening: refuse to send the bearer token to anything that
-	// isn't https + the innfactory.cloud / innfactory.ai trust boundary. Without this, a
-	// hostile module / typo'd env var / supply-chain compromise could
-	// exfil the admin key to an attacker-controlled host. Operators who
-	// genuinely need a custom endpoint (staging-via-tunnel, local dev) must
-	// opt in explicitly with INNFACTORYHUB_INSECURE_ENDPOINT=1.
+	// Endpoint hardening: refuse to send the bearer token to anything but
+	// https on one of the two hub hosts. Without this, a hostile module /
+	// typo'd env var / supply-chain compromise could exfil the admin key to
+	// an attacker-controlled host. Operators who genuinely need a custom
+	// endpoint (staging-via-tunnel, local dev) must opt in explicitly with
+	// INNFACTORYHUB_INSECURE_ENDPOINT=1.
 	insecure := os.Getenv("INNFACTORYHUB_INSECURE_ENDPOINT") == "1"
 	if err := validateEndpoint(endpoint, insecure); err != nil {
 		resp.Diagnostics.AddAttributeError(path.Root("endpoint"), "Refusing to send admin key", err.Error())
@@ -83,43 +94,61 @@ func (p *innfactoryhubProvider) Configure(ctx context.Context, req provider.Conf
 	}
 
 	client := newClient(endpoint, adminKey, p.version)
+	client.auditContext = sanitizeAuditContext(strFromAttrOrEnv(data.AuditContext, "INNFACTORYHUB_AUDIT_CONTEXT", ""))
 	resp.DataSourceData = client
 	resp.ResourceData = client
 }
 
-// trustedDomains are the registrable domains the admin key may be sent to:
-// innfactory.cloud (innfactoryHUB) and innfactory.ai (innFactory AI Hub).
-// Each domain is accepted as apex and with any subdomain — nothing else.
-var trustedDomains = []string{"innfactory.cloud", "innfactory.ai"}
+// trustedHosts are the only hosts the admin key may be sent to: the
+// innfactoryHUB and the innFactory AI Hub. Exact names, no subdomains — any
+// other name in these domains (staging sites, the licence site, a
+// subdomain-takeover) is untrusted.
+var trustedHosts = []string{"hub.innfactory.cloud", "hub.innfactory.ai"}
 
-// validateEndpoint enforces https + a trusted hostname unless the caller has
-// explicitly opted into insecure mode. Reject `http://`, raw IPs, and
-// arbitrary domains — those are the credential-exfil vectors a
-// public-registry provider has to defend against.
+// validateEndpoint accepts exactly https://<trusted host> (default port, no
+// credentials, path, query or fragment). The insecure opt-out accepts any
+// https host, and plain http only on the local machine (local dev, a
+// tunnel to staging) — never across the network.
 func validateEndpoint(raw string, insecure bool) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
 		return errNotAUrl
 	}
-	if u.Scheme != "https" && !insecure {
-		return errNotHttps
+	if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return errNotAnOrigin
 	}
-	if isTrustedHost(u.Hostname()) || insecure {
+	host := strings.ToLower(u.Hostname())
+	if u.Scheme == "https" && isTrustedHost(host) && (u.Port() == "" || u.Port() == "443") {
 		return nil
 	}
-	return errNotInnfactoryHost
+	if !insecure {
+		if u.Scheme != "https" {
+			return errNotHttps
+		}
+		return errNotInnfactoryHost
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if isLoopback(host) {
+			return nil
+		}
+		return errHttpNotLocal
+	}
+	return errNotHttps
 }
 
-// isTrustedHost matches label boundaries, so innfactory.ai.evil.com and
-// evilinnfactory.ai are refused while hub.innfactory.ai is accepted.
-func isTrustedHost(host string) bool {
-	host = strings.ToLower(host)
-	for _, domain := range trustedDomains {
-		if host == domain || strings.HasSuffix(host, "."+domain) {
-			return true
-		}
+func isTrustedHost(host string) bool { return slices.Contains(trustedHosts, host) }
+
+// isLoopback reports localhost or a loopback IP — never a name that merely
+// starts with "localhost".
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
 	}
-	return false
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (p *innfactoryhubProvider) Resources(_ context.Context) []func() resource.Resource {
@@ -138,8 +167,10 @@ func (p *innfactoryhubProvider) DataSources(_ context.Context) []func() datasour
 
 var (
 	errNotAUrl           = errEndpoint("endpoint is not a valid URL")
+	errNotAnOrigin       = errEndpoint("endpoint must be the bare origin, e.g. https://hub.innfactory.ai — no credentials, path, query or fragment")
 	errNotHttps          = errEndpoint("endpoint must use https:// — set INNFACTORYHUB_INSECURE_ENDPOINT=1 to override for local dev")
-	errNotInnfactoryHost = errEndpoint("endpoint host must be innfactory.cloud, innfactory.ai or one of their subdomains (e.g. hub.innfactory.cloud, hub.innfactory.ai) — set INNFACTORYHUB_INSECURE_ENDPOINT=1 to override for staging-via-tunnel or local dev")
+	errNotInnfactoryHost = errEndpoint("endpoint must be https://hub.innfactory.ai or https://hub.innfactory.cloud — set INNFACTORYHUB_INSECURE_ENDPOINT=1 to override for staging-via-tunnel or local dev")
+	errHttpNotLocal      = errEndpoint("plain http is only allowed to localhost or a loopback address, even with INNFACTORYHUB_INSECURE_ENDPOINT=1 — use https://")
 )
 
 type errEndpoint string

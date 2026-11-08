@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -221,5 +224,116 @@ func TestClientErrorsCarryDetails(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The client never follows a redirect: Go keeps the Authorization header on a
+// same-host redirect (even https → http), so following one could hand the
+// admin key to another scheme, port or path. A 3xx is an error instead.
+func TestClientDoesNotFollowRedirects(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+	}{
+		{name: "moved permanently", status: http.StatusMovedPermanently},
+		{name: "found", status: http.StatusFound},
+		{name: "see other", status: http.StatusSeeOther},
+		{name: "temporary redirect", status: http.StatusTemporaryRedirect},
+		{name: "permanent redirect", status: http.StatusPermanentRedirect},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var targetHits atomic.Int32
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				targetHits.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(target.Close)
+			var sourceHits atomic.Int32
+			source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sourceHits.Add(1)
+				if r.URL.Path == "/elsewhere" {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				// Alternate between another host and the same host.
+				loc := target.URL + "/steal"
+				if tc.status%2 == 0 {
+					loc = "/elsewhere"
+				}
+				w.Header().Set("Location", loc)
+				w.WriteHeader(tc.status)
+			}))
+			t.Cleanup(source.Close)
+
+			c := newClient(source.URL, testAdminKey, "test")
+			err := c.do(context.Background(), http.MethodPost, "/api/v1/admin/licenses", nil, map[string]any{"x": 1}, nil)
+			var ae *apiError
+			if !errors.As(err, &ae) || ae.Status != tc.status {
+				t.Fatalf("expected *apiError with status %d, got %T %v", tc.status, err, err)
+			}
+			if !strings.Contains(err.Error(), "redirect") {
+				t.Errorf("error does not mention the redirect: %v", err)
+			}
+			if n := targetHits.Load(); n != 0 {
+				t.Errorf("client followed the redirect to another host (%d request(s))", n)
+			}
+			if n := sourceHits.Load(); n != 1 {
+				t.Errorf("client sent %d request(s) to the Hub, want exactly 1", n)
+			}
+		})
+	}
+}
+
+func TestSanitizeAuditContext(t *testing.T) {
+	t.Parallel()
+	long := strings.Repeat("a", 300)
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty", in: "", want: ""},
+		{name: "blank", in: "  \n\t ", want: ""},
+		{name: "ci context kept", in: "run=https://github.com/acme/infra/actions/runs/42 commit=0123abc tenant=tnt_alpha",
+			want: "run=https://github.com/acme/infra/actions/runs/42 commit=0123abc tenant=tnt_alpha"},
+		{name: "newlines become spaces", in: "run=42\ncommit=abc\r\ntenant=x", want: "run=42 commit=abc  tenant=x"},
+		{name: "header injection is neutralised", in: "ok\r\nX-Evil: 1", want: "ok  X-Evil: 1"},
+		{name: "non-ascii replaced", in: "Mandant München", want: "Mandant M?nchen"},
+		{name: "control characters replaced", in: "a\x00b\x7fc", want: "a b c"},
+		{name: "cut to 256 characters", in: long, want: long[:256]},
+		{name: "secrets redacted", in: "key=" + secretAK, want: "key=ak_***REDACTED***"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := sanitizeAuditContext(tc.in)
+			if got != tc.want {
+				t.Fatalf("sanitizeAuditContext(%q)\n got: %q\nwant: %q", tc.in, got, tc.want)
+			}
+			if len(got) > maxAuditContext {
+				t.Fatalf("result longer than %d: %d", maxAuditContext, len(got))
+			}
+		})
+	}
+}
+
+// X-Audit-Context goes on every request when set and is absent otherwise.
+func TestClientSendsAuditContext(t *testing.T) {
+	t.Parallel()
+	hub := newFakeHub(t)
+	q := map[string][]string{"tenant_id": {alphaTenantID}}
+
+	c := newClient(hub.URL(), testAdminKey, "test")
+	if err := c.do(context.Background(), http.MethodGet, "/api/v1/admin/tenants/lookup", q, nil, nil); err != nil {
+		t.Fatalf("lookup without audit context: %v", err)
+	}
+	c.auditContext = "run=42 commit=abc"
+	if err := c.do(context.Background(), http.MethodGet, "/api/v1/admin/tenants/lookup", q, nil, nil); err != nil {
+		t.Fatalf("lookup with audit context: %v", err)
+	}
+	if got := hub.auditContexts(); !slices.Equal(got, []string{"", "run=42 commit=abc"}) {
+		t.Fatalf("X-Audit-Context per request = %q", got)
 	}
 }

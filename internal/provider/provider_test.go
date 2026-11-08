@@ -65,11 +65,13 @@ func configureProvider(t *testing.T, endpoint, adminKey *string) fwprovider.Conf
 		return tftypes.NewValue(tftypes.String, *v)
 	}
 	raw := tftypes.NewValue(tftypes.Object{AttributeTypes: map[string]tftypes.Type{
-		"endpoint":  tftypes.String,
-		"admin_key": tftypes.String,
+		"endpoint":      tftypes.String,
+		"admin_key":     tftypes.String,
+		"audit_context": tftypes.String,
 	}}, map[string]tftypes.Value{
-		"endpoint":  str(endpoint),
-		"admin_key": str(adminKey),
+		"endpoint":      str(endpoint),
+		"admin_key":     str(adminKey),
+		"audit_context": str(nil),
 	})
 
 	var resp fwprovider.ConfigureResponse
@@ -163,3 +165,54 @@ resource "innfactoryhub_api_key" "unused" {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// The audit context reaches the Hub on every request, from the provider
+// attribute or else from INNFACTORYHUB_AUDIT_CONTEXT, sanitised to one line.
+func TestProviderSendsAuditContext(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		attr string
+		want string
+	}{
+		{name: "from the environment", env: "run=https://ci.example/runs/42\ncommit=abc tenant=tnt_alpha",
+			want: "run=https://ci.example/runs/42 commit=abc tenant=tnt_alpha"},
+		{name: "attribute wins over the environment", env: "from-env", attr: "from-attribute", want: "from-attribute"},
+		{name: "unset", want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hub := newFakeHub(t)
+			useFakeHubEnv(t)
+			t.Setenv("INNFACTORYHUB_AUDIT_CONTEXT", tc.env)
+			attr := ""
+			if tc.attr != "" {
+				attr = fmt.Sprintf("  audit_context = %q\n", tc.attr)
+			}
+			cfg := fmt.Sprintf(`
+provider "innfactoryhub" {
+  endpoint  = %q
+  admin_key = %q
+%s}
+
+data "innfactoryhub_tenant" "self" {
+  tenant_id = %q
+}
+`, hub.URL(), testAdminKey, attr, alphaTenantID)
+
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testProviderFactories(),
+				Steps:                    []resource.TestStep{{Config: cfg}},
+			})
+			got := hub.auditContexts()
+			if len(got) == 0 {
+				t.Fatal("no request reached the Hub")
+			}
+			for i, v := range got {
+				if v != tc.want {
+					t.Fatalf("request %d sent X-Audit-Context %q, want %q", i, v, tc.want)
+				}
+			}
+		})
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -37,11 +38,14 @@ type fakeHub struct {
 	licenseKeys  []*fakeLicenseKey
 	positions    map[string]*fakePosition
 	calls        []string // "METHOD /path" in arrival order
+	audits       []string // X-Audit-Context per call, "" when absent
 	bodies       map[string][]map[string]any
 	nextID       int
 	// errorBody, when set, is returned with errorStatus for every request
-	// whose method matches errorMethod ("" = every method).
+	// whose method matches errorMethod ("" = every method) and whose path
+	// ends with errorPath ("" = every path).
 	errorMethod string
+	errorPath   string
 	errorStatus int
 	errorBody   string
 }
@@ -132,6 +136,7 @@ func newFakeHub(t *testing.T) *fakeHub {
 	mux.HandleFunc("GET /api/v1/admin/licenses/{id}", h.getLicense)
 	mux.HandleFunc("PATCH /api/v1/admin/licenses/{id}", h.patchLicense)
 	mux.HandleFunc("DELETE /api/v1/admin/licenses/{id}", h.endLicense)
+	mux.HandleFunc("POST /api/v1/admin/licenses/{id}/keys/rotate", h.rotateLicenseKey)
 
 	h.srv = httptest.NewServer(h.middleware(mux))
 	t.Cleanup(h.srv.Close)
@@ -149,13 +154,15 @@ func (h *fakeHub) middleware(next http.Handler) http.Handler {
 		var body map[string]any
 		decoded := json.Unmarshal(raw, &body) == nil
 
+		audit := r.Header.Get("X-Audit-Context")
 		h.mu.Lock()
 		h.calls = append(h.calls, call)
+		h.audits = append(h.audits, audit)
 		if decoded {
 			h.bodies[call] = append(h.bodies[call], body)
 		}
 		status, errBody := h.errorStatus, h.errorBody
-		failThis := h.errorMethod == "" || h.errorMethod == r.Method
+		failThis := (h.errorMethod == "" || h.errorMethod == r.Method) && strings.HasSuffix(r.URL.Path, h.errorPath)
 		h.mu.Unlock()
 
 		if status != 0 && failThis {
@@ -167,11 +174,26 @@ func (h *fakeHub) middleware(next http.Handler) http.Handler {
 			writeError(w, http.StatusUnauthorized, "invalid_api_key", "API key invalid")
 			return
 		}
+		if !fakeAuditContext.MatchString(audit) {
+			writeError(w, http.StatusBadRequest, "bad_request", "X-Audit-Context: at most 256 printable ASCII characters")
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
 
+// fakeAuditContext is the Hub's rule for X-Audit-Context: at most 256
+// printable ASCII characters, no line breaks.
+var fakeAuditContext = regexp.MustCompile(`^[\x20-\x7e]{0,256}$`)
+
 // --- inspection helpers (all lock-protected) ---
+
+// auditContexts lists the X-Audit-Context of every call in arrival order.
+func (h *fakeHub) auditContexts() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.audits...)
+}
 
 // writeCalls lists every non-GET request the provider sent.
 func (h *fakeHub) writeCalls() []string {
@@ -201,7 +223,7 @@ func (h *fakeHub) callCount() int {
 func (h *fakeHub) resetCalls() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.calls = nil
+	h.calls, h.audits = nil, nil
 }
 
 func (h *fakeHub) lastBody(methodPath string) map[string]any {
@@ -255,9 +277,15 @@ func (h *fakeHub) failAll(status int, raw string) { h.failMethod("", status, raw
 
 // failMethod fails only requests with the given method; status 0 clears it.
 func (h *fakeHub) failMethod(method string, status int, raw string) {
+	h.failPath(method, "", status, raw)
+}
+
+// failPath fails only requests with the given method whose path ends with
+// suffix; status 0 clears it.
+func (h *fakeHub) failPath(method, suffix string, status int, raw string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.errorMethod, h.errorStatus, h.errorBody = method, status, raw
+	h.errorMethod, h.errorPath, h.errorStatus, h.errorBody = method, suffix, status, raw
 }
 
 func (h *fakeHub) apiKeyIDs() []string {
@@ -565,6 +593,7 @@ func useFakeHubEnv(t *testing.T) {
 	t.Setenv("INNFACTORYHUB_INSECURE_ENDPOINT", "1")
 	t.Setenv("INNFACTORYHUB_ADMIN_KEY", "")
 	t.Setenv("INNFACTORYHUB_ENDPOINT", "")
+	t.Setenv("INNFACTORYHUB_AUDIT_CONTEXT", "")
 }
 
 // providerBlock renders a provider configuration against the fake Hub.

@@ -22,7 +22,9 @@ import (
 //   - PATCH merges only the given params; no change means no new revision;
 //     the same position or the same reason without max_until is a no-op
 //   - DELETE ends the licence (status ended) and frees the position; repeatable
-//   - the plaintext key exists only in the create response
+//   - the plaintext key exists only in the create and rotation responses
+//   - POST …/keys/rotate issues a new key and revokes every earlier one, also
+//     for suspended or expired licences, never for ended ones (409 license_ended)
 
 // Seeded fixtures for licence tests.
 const (
@@ -210,6 +212,34 @@ func (h *fakeHub) endLicenseOutOfBand(id string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.endLicenseLocked(h.licenses[id], "admin")
+}
+
+// suspendLicenseOutOfBand suspends a licence as an admin in the portal would.
+func (h *fakeHub) suspendLicenseOutOfBand(id string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.licenses[id].Status = "suspended"
+}
+
+// rotateKeyOutOfBand rotates the licence key as an admin or the customer in
+// the portal would; the new key never reaches Terraform.
+func (h *fakeHub) rotateKeyOutOfBand(id string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.rotateKeyLocked(id)
+}
+
+// activeKeyIDs lists the unrevoked key ids of a licence.
+func (h *fakeHub) activeKeyIDs(licenseID string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []string
+	for _, k := range h.licenseKeys {
+		if k.licenseID == licenseID && k.RevokedAt == nil {
+			out = append(out, k.KeyID)
+		}
+	}
+	return out
 }
 
 // --- handlers ---
@@ -560,6 +590,36 @@ func (h *fakeHub) mintLicenseKeyLocked(licenseID string) string {
 		licenseID: licenseID, plaintext: plaintext,
 	})
 	return plaintext
+}
+
+// rotateKeyLocked revokes every key of the licence and issues a new one.
+// Caller holds mu.
+func (h *fakeHub) rotateKeyLocked(licenseID string) (string, fakeLicenseKey) {
+	at := nowISO()
+	for _, k := range h.licenseKeys {
+		if k.licenseID == licenseID && k.RevokedAt == nil {
+			k.RevokedAt = &at
+		}
+	}
+	plaintext := h.mintLicenseKeyLocked(licenseID)
+	return plaintext, *h.licenseKeys[len(h.licenseKeys)-1]
+}
+
+// rotateLicenseKey mirrors POST /licenses/:id/keys/rotate → {license_key, key}.
+func (h *fakeHub) rotateLicenseKey(w http.ResponseWriter, r *http.Request) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	l, ok := h.licenses[r.PathValue("id")]
+	if !ok {
+		(&fakeHTTPError{status: http.StatusNotFound, code: "license_not_found", message: "Lizenz nicht gefunden"}).write(w)
+		return
+	}
+	if l.Status == "ended" {
+		(&fakeHTTPError{status: http.StatusConflict, code: "license_ended", message: "Die Lizenz ist beendet"}).write(w)
+		return
+	}
+	plaintext, key := h.rotateKeyLocked(l.LicenseID)
+	writeData(w, http.StatusOK, map[string]any{"license_key": plaintext, "key": key})
 }
 
 func (h *fakeHub) getLicense(w http.ResponseWriter, r *http.Request) {

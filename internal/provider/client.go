@@ -19,8 +19,9 @@ import (
 
 // Hub admin API client used by every resource + data source. Wraps net/http
 // with a User-Agent that identifies the provider version (so Hub audit_log
-// can attribute changes), a 30s timeout, structured tflog tracing, and
-// TLS 1.2+ enforcement.
+// can attribute changes), an optional X-Audit-Context (who ran Terraform —
+// e.g. the CI run), a 30s timeout, structured tflog tracing, TLS 1.2+
+// enforcement, and no redirects.
 //
 // Authentication: the system-scope `ak_…` key is sent as
 // `Authorization: Bearer ak_<id>.<secret>` exactly as the Hub expects.
@@ -32,7 +33,10 @@ type httpClient struct {
 	base      string
 	adminKey  string
 	userAgent string
-	http      *http.Client
+	// auditContext is sent as X-Audit-Context when non-empty; set it only
+	// through sanitizeAuditContext.
+	auditContext string
+	http         *http.Client
 }
 
 func newClient(endpoint, adminKey, version string) *httpClient {
@@ -47,8 +51,36 @@ func newClient(endpoint, adminKey, version string) *httpClient {
 		http: &http.Client{
 			Timeout:   30 * time.Second,
 			Transport: tr,
+			// Never follow a redirect: Go keeps the Authorization header on a
+			// same-host redirect, even from https to http or to another port.
+			// The Hub API does not redirect, so any 3xx is reported as an error.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
+}
+
+// maxAuditContext is the Hub's limit for X-Audit-Context.
+const maxAuditContext = 256
+
+// sanitizeAuditContext makes s safe for the X-Audit-Context header and the
+// Hub's audit log: printable ASCII only (control characters such as line
+// breaks become spaces, anything else '?'), no secrets, at most 256
+// characters. A blank result means "send no header".
+func sanitizeAuditContext(s string) string {
+	s = strings.Map(func(r rune) rune {
+		switch {
+		case r < 0x20 || r == 0x7f:
+			return ' '
+		case r > 0x7e:
+			return '?'
+		}
+		return r
+	}, s)
+	s = strings.TrimSpace(redact(s))
+	if len(s) > maxAuditContext {
+		s = strings.TrimSpace(s[:maxAuditContext])
+	}
+	return s
 }
 
 type apiError struct {
@@ -164,6 +196,9 @@ func (c *httpClient) do(ctx context.Context, method, path string, query url.Valu
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json")
+	if c.auditContext != "" {
+		req.Header.Set("X-Audit-Context", c.auditContext)
+	}
 
 	// Log only the path — not the query string — at trace level. The query
 	// can contain customer cloud handles which are not secrets but still
@@ -189,6 +224,9 @@ func (c *httpClient) do(ctx context.Context, method, path string, query url.Valu
 		"bytes":  len(raw),
 	})
 
+	if res.StatusCode >= 300 && res.StatusCode < 400 {
+		return redirectError(res)
+	}
 	if res.StatusCode >= 400 {
 		ae := &apiError{Status: res.StatusCode}
 		var env struct {
@@ -217,6 +255,19 @@ func (c *httpClient) do(ctx context.Context, method, path string, query url.Valu
 		return fmt.Errorf("decode response: %w", redactErr(err))
 	}
 	return nil
+}
+
+// redirectError reports a 3xx the client refused to follow. The target is
+// shown (redacted and capped) so a misconfigured endpoint is easy to spot.
+func redirectError(res *http.Response) *apiError {
+	loc := res.Header.Get("Location")
+	if len(loc) > maxBodyForError {
+		loc = loc[:maxBodyForError] + "…"
+	}
+	return &apiError{
+		Status:  res.StatusCode,
+		Message: redact(fmt.Sprintf("unexpected redirect to %q refused — the endpoint must be the Hub itself, e.g. https://hub.innfactory.ai", loc)),
+	}
 }
 
 // redactErr wraps an error such that any printed form runs through redact().
