@@ -5,7 +5,11 @@ version: 2
 
 before:
   hooks:
-    - go mod tidy
+    # Release exactly the committed module graph: verify the downloaded
+    # modules against go.sum and refuse a go.mod/go.sum that differs from
+    # the tag. Never `go mod tidy` here — it could change what gets signed.
+    - go mod verify
+    - git diff --exit-code go.mod go.sum
 
 builds:
   - env:
@@ -34,7 +38,7 @@ builds:
     binary: '{{ .ProjectName }}_v{{ .Version }}'
 
 archives:
-  - format: zip
+  - formats: [zip]
     name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
 
 checksum:
