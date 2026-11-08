@@ -17,7 +17,7 @@ Mints an API key in innFactory Hub or the [innFactory AI Hub](https://hub.innfac
 Error: API key revoked in the Hub – change rotation_trigger to mint a new one
 ```
 
-Change `rotation_trigger` to mint a new key on purpose, or remove the resource from the configuration to retire it. To take a key away from a customer installation, revoke it in the Hub — Terraform does not undo that.
+Change `rotation_trigger` to mint a new key on purpose — the plan then warns `Re-minting an API key that was revoked in the Hub` (or `… expired`, `… deleted`) next to the replacement — or remove the resource from the configuration to retire it. To take a key away from a customer installation, revoke it in the Hub — Terraform does not undo that.
 
 On the AI Hub, Terraform manages **organization** keys: an API key can never create a system key there (`403 forbidden_key_minting`); staff mint system keys in the portal (with TOTP). With a `["read", "licensing"]` admin key the provider may create exactly the companyADMIN key: `scope = "organization"`, `permissions = ["read_maintenance"]` and an `expires_at` (required for this key, at most 24 months ahead) — anything else is `403 forbidden_key_scope`.
 

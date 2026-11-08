@@ -285,7 +285,7 @@ func (r *apiKeyResource) ModifyPlan(ctx context.Context, req resource.ModifyPlan
 		return
 	}
 	status := state.Status.ValueString()
-	if status == "" || status == apiKeyActive || !plan.RotationTrigger.Equal(state.RotationTrigger) {
+	if status == "" || status == apiKeyActive {
 		return
 	}
 	what := map[string]string{
@@ -293,6 +293,16 @@ func (r *apiKeyResource) ModifyPlan(ctx context.Context, req resource.ModifyPlan
 		apiKeyExpired: "expired",
 		apiKeyDeleted: "deleted in the Hub",
 	}[status]
+	if !plan.RotationTrigger.Equal(state.RotationTrigger) {
+		summary := "Re-minting an API key that expired"
+		if status != apiKeyExpired {
+			summary = "Re-minting an API key that was " + what
+		}
+		resp.Diagnostics.AddAttributeWarning(path.Root("rotation_trigger"), summary,
+			fmt.Sprintf("Key %s (%q) is %s. rotation_trigger changed, so this apply mints a new key with the same permissions. "+
+				"Make sure the key was not revoked on purpose.", state.ID.ValueString(), state.Name.ValueString(), status))
+		return
+	}
 	resp.Diagnostics.AddAttributeError(path.Root("rotation_trigger"),
 		fmt.Sprintf("API key %s – change rotation_trigger to mint a new one", what),
 		fmt.Sprintf("Key %s (%q) is %s. Terraform does not mint a replacement on its own, so a revocation in the Hub stays effective. "+

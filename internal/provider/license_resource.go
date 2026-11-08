@@ -759,6 +759,9 @@ func (r *licenseResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	switch {
 	case state.Status.ValueString() == licenseStatusEnded && rotate:
 		resp.RequiresReplace = append(resp.RequiresReplace, trigger)
+		resp.Diagnostics.AddAttributeWarning(trigger, "Re-issuing a licence that was ended in the AI Hub",
+			fmt.Sprintf("Licence %s was ended in the AI Hub. rotation_trigger changed, so this apply issues a new licence with a new key "+
+				"for environment %s. Make sure the licence was not ended on purpose.", state.ID.ValueString(), state.EnvironmentID.ValueString()))
 	case state.Status.ValueString() == licenseStatusEnded:
 		resp.Diagnostics.AddAttributeError(trigger, "Licence ended in the AI Hub – change rotation_trigger to issue a new one",
 			fmt.Sprintf("Licence %s was ended in the AI Hub (e.g. in the portal). Terraform does not undo that on its own. "+

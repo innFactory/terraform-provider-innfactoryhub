@@ -27,7 +27,7 @@ Re-running `apply` without changes plans nothing and sends no write request: no 
 To take a licence away, **end or suspend it in the Hub** (portal). Terraform does not undo that:
 
 - A **suspended** licence stays suspended: `status = "suspended"`, the plan stays empty, Terraform never resumes it.
-- An **ended** licence stays in state with `status = "ended"` and is **not** re-issued. Every plan that keeps the resource fails with `Licence ended in the AI Hub – change rotation_trigger to issue a new one`. Change `rotation_trigger` to issue a new licence (with a new key) on purpose, or remove the resource from the configuration.
+- An **ended** licence stays in state with `status = "ended"` and is **not** re-issued. Every plan that keeps the resource fails with `Licence ended in the AI Hub – change rotation_trigger to issue a new one`. Change `rotation_trigger` to issue a new licence (with a new key) on purpose — the plan then warns `Re-issuing a licence that was ended in the AI Hub` next to the replacement — or remove the resource from the configuration.
 - A **key rotated or revoked in the Hub** (portal, customer self-service) leaves the key in state dead: `key_status = "revoked"`, and every plan fails with `Licence key revoked in the AI Hub – change rotation_trigger to issue a new key` until `rotation_trigger` changes, which rotates the key of the same licence in place. Terraform never ships the revoked key silently, and never rotates on its own.
 
 ### Lost answers
