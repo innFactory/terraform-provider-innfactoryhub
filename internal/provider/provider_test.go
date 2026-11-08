@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 	"testing"
 
 	fwprovider "github.com/hashicorp/terraform-plugin-framework/provider"
@@ -208,6 +209,43 @@ data "innfactoryhub_tenant" "self" {
 				if v != tc.want {
 					t.Fatalf("request %d sent X-Audit-Context %q, want %q", i, v, tc.want)
 				}
+			}
+		})
+	}
+}
+
+// The opt-out is loud: every configuration with it warns, and it needs the
+// host named in INNFACTORYHUB_INSECURE_ENDPOINT_HOST.
+func TestConfigureInsecureEndpointOptOut(t *testing.T) {
+	cases := []struct {
+		name     string
+		insecure string
+		host     string
+		endpoint string
+		wantErr  bool
+		wantWarn bool
+	}{
+		{name: "opt-out with matching host warns", insecure: "1", host: "staging.example.com", endpoint: "https://staging.example.com", wantWarn: true},
+		{name: "opt-out without host is refused", insecure: "1", endpoint: "https://staging.example.com", wantErr: true},
+		{name: "host without opt-out is refused", host: "staging.example.com", endpoint: "https://staging.example.com", wantErr: true},
+		{name: "opt-out set for a trusted host still warns", insecure: "1", host: "localhost", endpoint: "https://hub.innfactory.ai", wantWarn: true},
+		{name: "no opt-out, trusted host, no warning", endpoint: "https://hub.innfactory.ai"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("INNFACTORYHUB_INSECURE_ENDPOINT", tc.insecure)
+			t.Setenv("INNFACTORYHUB_INSECURE_ENDPOINT_HOST", tc.host)
+			t.Setenv("INNFACTORYHUB_ENDPOINT", "")
+			resp := configureProvider(t, ptr(tc.endpoint), ptr(testAdminKey))
+			if got := resp.Diagnostics.HasError(); got != tc.wantErr {
+				t.Fatalf("error = %v, want %v: %v", got, tc.wantErr, resp.Diagnostics)
+			}
+			var warned bool
+			for _, d := range resp.Diagnostics.Warnings() {
+				warned = warned || strings.Contains(d.Detail(), "INNFACTORYHUB_INSECURE_ENDPOINT")
+			}
+			if warned != tc.wantWarn {
+				t.Fatalf("warning = %v, want %v: %v", warned, tc.wantWarn, resp.Diagnostics)
 			}
 		})
 	}

@@ -141,7 +141,7 @@ To take something away from a customer installation, do it in the Hub — Terraf
 
 The admin key is sent **only** to `https://hub.innfactory.ai` and `https://hub.innfactory.cloud` — exactly these hosts on the default port, as a bare origin (no credentials, path, query or fragment). Other names in these domains (`staging.innfactory.cloud`, `license.innfactory.ai`, …) are refused at provider configuration, as are look-alikes such as `hub.innfactory.ai.evil.com`.
 
-For local development or a tunnel to staging, `INNFACTORYHUB_INSECURE_ENDPOINT=1` lifts the host pin: any `https://` host is then accepted, plain `http://` only on `localhost` or a loopback address. Do not set it in CI.
+For local development or a tunnel to staging, set **both** `INNFACTORYHUB_INSECURE_ENDPOINT=1` and `INNFACTORYHUB_INSECURE_ENDPOINT_HOST=<host>` — the host of the endpoint, e.g. `127.0.0.1`. That opens exactly this one host: over `https://`, or plain `http://` if it is `localhost` or a loopback address. `=1` alone is refused, and every configuration warns while the opt-out is set. Do not set it in CI.
 
 The client never follows redirects (Go would keep the `Authorization` header on a same-host redirect, even to `http://`); a `3xx` answer is an error. TLS ≥ 1.2 is enforced. Error messages are scrubbed before they reach Terraform output: anything shaped like an API key (`ak_…`), a licence key (`lk_…`) or a JWT (`eyJ….….…`) is replaced by a placeholder.
 
@@ -151,6 +151,6 @@ Creates of environments and licences carry an `Idempotency-Key`; a create whose 
 
 ### Optional
 
-- `endpoint` (String) `https://hub.innfactory.ai` (innFactory AI Hub) or `https://hub.innfactory.cloud` (innfactoryHUB, the default). Override via `INNFACTORYHUB_ENDPOINT`. Other hosts only with `INNFACTORYHUB_INSECURE_ENDPOINT=1`.
+- `endpoint` (String) `https://hub.innfactory.ai` (innFactory AI Hub) or `https://hub.innfactory.cloud` (innfactoryHUB, the default). Override via `INNFACTORYHUB_ENDPOINT`. Another host only with `INNFACTORYHUB_INSECURE_ENDPOINT=1` plus `INNFACTORYHUB_INSECURE_ENDPOINT_HOST=<that host>`.
 - `admin_key` (String, Sensitive) System-scope admin key — on the AI Hub `["read", "licensing"]` to apply, `["read_licensing"]` to plan. Override via `INNFACTORYHUB_ADMIN_KEY`. Only checked when an operation calls the Hub.
 - `audit_context` (String) Free text stored with every change in the Hub's audit log (`X-Audit-Context`), e.g. CI run, commit and customer; sanitised to at most 256 printable ASCII characters. Override via `INNFACTORYHUB_AUDIT_CONTEXT`.

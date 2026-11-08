@@ -103,7 +103,7 @@ Pass exactly one of these to `data "innfactoryhub_tenant"`:
 
 This provider holds a **system-scope admin key**. On the AI Hub, use the narrow `["read", "licensing"]` key for applies and `["read_licensing"]` for plans; still treat it like a production credential.
 
-- The bearer is sent ONLY over HTTPS to exactly `hub.innfactory.ai` or `hub.innfactory.cloud` (default port, bare origin). Other names in these domains, look-alikes such as `hub.innfactory.ai.evil.com`, credentials, paths and queries are refused at provider configure time. `INNFACTORYHUB_INSECURE_ENDPOINT=1` (local dev / staging-via-tunnel only) opens other https hosts, and plain http only to localhost/loopback.
+- The bearer is sent ONLY over HTTPS to exactly `hub.innfactory.ai` or `hub.innfactory.cloud` (default port, bare origin). Other names in these domains, look-alikes such as `hub.innfactory.ai.evil.com`, credentials, paths and queries are refused at provider configure time. `INNFACTORYHUB_INSECURE_ENDPOINT=1` together with `INNFACTORYHUB_INSECURE_ENDPOINT_HOST=<host>` (local dev / staging-via-tunnel only) opens exactly that one host — over https, or plain http if it is localhost/loopback — and every configuration warns while it is set.
 - Redirects are never followed — Go would keep `Authorization` on a same-host redirect, even to http — and a 3xx is an error.
 - 4xx/5xx response bodies are truncated to 512 bytes, and every error text is scrubbed for API keys (`ak_…`), licence keys (`lk_…`) and JWTs (`eyJ….….…`) before reaching Terraform diagnostics — so a misbehaving proxy that echoes the Authorization header into an error page can't leak a key into CI logs.
 - The HTTP transport pins TLS ≥ 1.2.
@@ -121,7 +121,7 @@ go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 go build .
 ```
 
-The resource tests run real `terraform` plans against an in-process fake Hub (`httptest`) via `terraform-plugin-testing`'s `resource.UnitTest`. The fake mirrors the AI Hub's contract: key permissions (`licensing`, `read_licensing`, `read_maintenance`), key rotation, idempotent creates (and lost answers), out-of-band revocations. They need a Terraform CLI: either on `PATH`, at `TF_ACC_TERRAFORM_PATH`, or the harness downloads the latest release. No real Hub is ever called; the tests set `INNFACTORYHUB_INSECURE_ENDPOINT=1` only for the loopback fake.
+The resource tests run real `terraform` plans against an in-process fake Hub (`httptest`) via `terraform-plugin-testing`'s `resource.UnitTest`. The fake mirrors the AI Hub's contract: key permissions (`licensing`, `read_licensing`, `read_maintenance`), key rotation, idempotent creates (and lost answers), out-of-band revocations. They need a Terraform CLI: either on `PATH`, at `TF_ACC_TERRAFORM_PATH`, or the harness downloads the latest release. No real Hub is ever called; the tests set `INNFACTORYHUB_INSECURE_ENDPOINT=1` with `INNFACTORYHUB_INSECURE_ENDPOINT_HOST=127.0.0.1` only for the loopback fake.
 
 For local debugging, run `./terraform-provider-innfactoryhub --debug` and follow the printed `TF_REATTACH_PROVIDERS` instructions.
 

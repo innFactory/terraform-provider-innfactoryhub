@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -46,7 +47,7 @@ func (p *innfactoryhubProvider) Schema(_ context.Context, _ provider.SchemaReque
 		Attributes: map[string]schema.Attribute{
 			"endpoint": schema.StringAttribute{
 				Optional:    true,
-				Description: "Base URL of the Hub admin API: https://hub.innfactory.ai (innFactory AI Hub) or https://hub.innfactory.cloud (innfactoryHUB, the default). No other host is accepted unless INNFACTORYHUB_INSECURE_ENDPOINT=1 is set (local development). Override via env INNFACTORYHUB_ENDPOINT.",
+				Description: "Base URL of the Hub admin API: https://hub.innfactory.ai (innFactory AI Hub) or https://hub.innfactory.cloud (innfactoryHUB, the default). Another host only with INNFACTORYHUB_INSECURE_ENDPOINT=1 plus INNFACTORYHUB_INSECURE_ENDPOINT_HOST=<that host> (local development; warns). Override via env INNFACTORYHUB_ENDPOINT.",
 			},
 			"admin_key": schema.StringAttribute{
 				Optional:  true,
@@ -86,11 +87,19 @@ func (p *innfactoryhubProvider) Configure(ctx context.Context, req provider.Conf
 	// typo'd env var / supply-chain compromise could exfil the admin key to
 	// an attacker-controlled host. Operators who genuinely need a custom
 	// endpoint (staging-via-tunnel, local dev) must opt in explicitly with
-	// INNFACTORYHUB_INSECURE_ENDPOINT=1.
+	// INNFACTORYHUB_INSECURE_ENDPOINT=1 and name that very host in
+	// INNFACTORYHUB_INSECURE_ENDPOINT_HOST.
 	insecure := os.Getenv("INNFACTORYHUB_INSECURE_ENDPOINT") == "1"
-	if err := validateEndpoint(endpoint, insecure); err != nil {
+	allowedHost := os.Getenv("INNFACTORYHUB_INSECURE_ENDPOINT_HOST")
+	if err := validateEndpoint(endpoint, insecure, allowedHost); err != nil {
 		resp.Diagnostics.AddAttributeError(path.Root("endpoint"), "Refusing to send admin key", err.Error())
 		return
+	}
+	if insecure {
+		resp.Diagnostics.AddAttributeWarning(path.Root("endpoint"), "Endpoint host pin disabled",
+			fmt.Sprintf("INNFACTORYHUB_INSECURE_ENDPOINT=1 is set: the admin key is sent to %s (INNFACTORYHUB_INSECURE_ENDPOINT_HOST=%q) "+
+				"instead of only to https://hub.innfactory.ai or https://hub.innfactory.cloud. Use it for local development only, never in CI.",
+				redact(endpoint), allowedHost))
 	}
 
 	client := newClient(endpoint, adminKey, p.version)
@@ -106,10 +115,11 @@ func (p *innfactoryhubProvider) Configure(ctx context.Context, req provider.Conf
 var trustedHosts = []string{"hub.innfactory.cloud", "hub.innfactory.ai"}
 
 // validateEndpoint accepts exactly https://<trusted host> (default port, no
-// credentials, path, query or fragment). The insecure opt-out accepts any
-// https host, and plain http only on the local machine (local dev, a
-// tunnel to staging) — never across the network.
-func validateEndpoint(raw string, insecure bool) error {
+// credentials, path, query or fragment). The insecure opt-out accepts one
+// more host, the one named in allowedHost (both are needed): over https, or
+// over plain http when it is the local machine (local dev, a tunnel to
+// staging) — never plain http across the network.
+func validateEndpoint(raw string, insecure bool, allowedHost string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
 		return errNotAUrl
@@ -121,11 +131,15 @@ func validateEndpoint(raw string, insecure bool) error {
 	if u.Scheme == "https" && isTrustedHost(host) && (u.Port() == "" || u.Port() == "443") {
 		return nil
 	}
-	if !insecure {
-		if u.Scheme != "https" {
-			return errNotHttps
-		}
+	switch {
+	case !insecure && u.Scheme != "https":
+		return errNotHttps
+	case !insecure:
 		return errNotInnfactoryHost
+	case strings.TrimSpace(allowedHost) == "":
+		return errOptOutWithoutHost
+	case !strings.EqualFold(host, strings.TrimSpace(allowedHost)):
+		return errNotAllowedHost
 	}
 	switch u.Scheme {
 	case "https":
@@ -169,8 +183,10 @@ var (
 	errNotAUrl           = errEndpoint("endpoint is not a valid URL")
 	errNotAnOrigin       = errEndpoint("endpoint must be the bare origin, e.g. https://hub.innfactory.ai — no credentials, path, query or fragment")
 	errNotHttps          = errEndpoint("endpoint must use https:// — set INNFACTORYHUB_INSECURE_ENDPOINT=1 to override for local dev")
-	errNotInnfactoryHost = errEndpoint("endpoint must be https://hub.innfactory.ai or https://hub.innfactory.cloud — set INNFACTORYHUB_INSECURE_ENDPOINT=1 to override for staging-via-tunnel or local dev")
+	errNotInnfactoryHost = errEndpoint("endpoint must be https://hub.innfactory.ai or https://hub.innfactory.cloud — for staging-via-tunnel or local dev set INNFACTORYHUB_INSECURE_ENDPOINT=1 and INNFACTORYHUB_INSECURE_ENDPOINT_HOST=<host>")
 	errHttpNotLocal      = errEndpoint("plain http is only allowed to localhost or a loopback address, even with INNFACTORYHUB_INSECURE_ENDPOINT=1 — use https://")
+	errOptOutWithoutHost = errEndpoint("INNFACTORYHUB_INSECURE_ENDPOINT=1 also needs INNFACTORYHUB_INSECURE_ENDPOINT_HOST=<host> naming the endpoint's host")
+	errNotAllowedHost    = errEndpoint("the endpoint's host is not the one named in INNFACTORYHUB_INSECURE_ENDPOINT_HOST")
 )
 
 type errEndpoint string

@@ -612,12 +612,14 @@ func testProviderFactories() map[string]func() (tfprotov6.ProviderServer, error)
 	}
 }
 
-// useFakeHubEnv permits the plain-http loopback endpoint of the fake Hub and
+// useFakeHubEnv permits the plain-http loopback endpoint of the fake Hub
+// (127.0.0.1, named in INNFACTORYHUB_INSECURE_ENDPOINT_HOST) and
 // clears any admin key exported in the developer's shell. Uses t.Setenv, so
 // callers must not run in parallel.
 func useFakeHubEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("INNFACTORYHUB_INSECURE_ENDPOINT", "1")
+	t.Setenv("INNFACTORYHUB_INSECURE_ENDPOINT_HOST", "127.0.0.1")
 	t.Setenv("INNFACTORYHUB_ADMIN_KEY", "")
 	t.Setenv("INNFACTORYHUB_ENDPOINT", "")
 	t.Setenv("INNFACTORYHUB_AUDIT_CONTEXT", "")

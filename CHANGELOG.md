@@ -6,7 +6,7 @@ Prepared for release; the tag `v0.2.0` is pushed manually after approval (GoRele
 
 **Upgrade notes**
 
-- The endpoint must be exactly `https://hub.innfactory.ai` or `https://hub.innfactory.cloud`. Other names in these domains need `INNFACTORYHUB_INSECURE_ENDPOINT=1`, and plain http now only works to localhost/loopback even then.
+- The endpoint must be exactly `https://hub.innfactory.ai` or `https://hub.innfactory.cloud`. Any other host needs `INNFACTORYHUB_INSECURE_ENDPOINT=1` **and** `INNFACTORYHUB_INSECURE_ENDPOINT_HOST=<that host>`; plain http only works to localhost/loopback even then, and the provider warns while the opt-out is set.
 - On the AI Hub, run applies with a system key `["read", "licensing"]` (at most 90 days) and plans with `["read_licensing"]`. API keys can no longer create system keys there (`403 forbidden_key_minting`).
 - A licence ended in the Hub, a licence key rotated there and an API key revoked, deleted or expired there now make plans fail until `rotation_trigger` changes — they were silently re-issued before.
 - `innfactoryhub_license.rotation_trigger` rotates the key in place instead of replacing the licence.
@@ -51,7 +51,7 @@ Prepared for release; the tag `v0.2.0` is pushed manually after approval (GoRele
 
 - SEC-005 — release pipeline: every action pinned to a commit SHA, GoReleaser pinned to v2.19.0, release job in the protected `release` environment with minimal permissions, no Go cache, no persisted checkout credentials, `go mod verify` + `git diff --exit-code go.mod go.sum` instead of `go mod tidy`, build provenance attested (`actions/attest-build-provenance`). Required reviewers and the `v*` tag ruleset are repository settings (README, "Releases").
 - SEC-006 — revocations in the Hub are no longer undone by the next apply (licences ended, licence keys rotated, API keys revoked/deleted/expired).
-- SEC-009 — the admin key goes only to exactly `hub.innfactory.ai` and `hub.innfactory.cloud` (default port, bare origin); with `INNFACTORYHUB_INSECURE_ENDPOINT=1` other https hosts, plain http only to loopback.
+- SEC-009 — the admin key goes only to exactly `hub.innfactory.ai` and `hub.innfactory.cloud` (default port, bare origin); the opt-out needs `INNFACTORYHUB_INSECURE_ENDPOINT=1` plus `INNFACTORYHUB_INSECURE_ENDPOINT_HOST=<host>` and opens only that host (https, or http on loopback), with a warning on every configuration.
 - SEC-010 — the HTTP client follows no redirects; a 3xx is an error.
 - SEC-011 — key rotation no longer ends the licence (no gap without licence, no lost instance history or position link); keys rotated outside Terraform are detected.
 - SEC-012 — Go 1.26.10 (GO-2026-6809, crypto/x509) and dependencies without known vulnerabilities (govulncheck).
