@@ -19,11 +19,7 @@ import (
 // schemas (duplicate attribute names, malformed types) at build time.
 func TestProviderServerSmoke(t *testing.T) {
 	t.Parallel()
-	factory := providerserver.NewProtocol6(New("test")())
-	server, err := factory().(tfprotov6.ProviderServer), error(nil)
-	if err != nil {
-		t.Fatalf("unexpected factory error: %v", err)
-	}
+	server := providerserver.NewProtocol6(New("test")())()
 	if server == nil {
 		t.Fatal("expected non-nil provider server")
 	}
