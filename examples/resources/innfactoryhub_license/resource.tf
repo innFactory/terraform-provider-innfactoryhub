@@ -42,7 +42,8 @@ resource "innfactoryhub_license" "ai_gateway" {
   contract_position_id = var.contract_position_id
   unbilled_reason      = var.contract_position_id == null ? "trial" : null
 
-  # Change this value to rotate the licence key (issues a new licence).
+  # Change this value to rotate the licence key (same licence, new key; the
+  # previous key stops working at once).
   rotation_trigger = "2026-11"
 }
 

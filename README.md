@@ -4,7 +4,7 @@
 
 Manages API keys, environments and licences and reads tenant identifiers in [innFactory Hub](https://hub.innfactory.cloud) and the [innFactory AI Hub](https://hub.innfactory.ai). Both hubs serve the same tenant-lookup and API-key paths, so one provider talks to either.
 
-Intended primarily for CompanyGPT customer deployments: at deploy-time of a customer's stack, resolve the right Hub tenant from the GCP project ID (or Azure subscription / Azure tenant / AWS account / Hub tenant_id), mint a read-only org-scoped API key, and feed it to the dashboard's runtime as a sensitive output — and register the customer's AI Gateway installation as an environment in the AI Hub and issue its licence.
+Intended primarily for CompanyGPT customer deployments: at deploy-time of a customer's stack, resolve the right Hub tenant from the GCP project ID (or Azure subscription / Azure tenant / AWS account / Hub tenant_id), register the customer's AI Gateway installation as an environment in the AI Hub, issue its licence, and mint the companyADMIN maintenance key — handed to the runtime as sensitive outputs.
 
 ## Quick start
 
@@ -33,6 +33,19 @@ resource "innfactoryhub_api_key" "companygpt" {
 ```
 
 Export `INNFACTORYHUB_ADMIN_KEY` with a system-scope admin key (mint one in *Hub → Stammdaten → API-Keys*). A missing key only fails the first operation that calls the Hub, not the provider configuration — so a `count`-gated secret read is enough.
+
+### CompanyGPT on the innFactory AI Hub
+
+| What | Key / attribute |
+|---|---|
+| Apply (CI, protected branch) | `INNFACTORYHUB_ADMIN_KEY` = system key `["read", "licensing"]`, at most **90 days** |
+| Plan (pull requests) | `INNFACTORYHUB_ADMIN_KEY` = system key `["read_licensing"]` (read-only; writes fail with `403 forbidden_read_only_key`) |
+| companyADMIN | `innfactoryhub_api_key`: `scope = "organization"`, `permissions = ["read_maintenance"]`, `expires_at` (≤ 24 months), `rotation_trigger` — see [docs/resources/api_key.md](docs/resources/api_key.md) |
+| Gateway licence | `innfactoryhub_license.license_key`; rotate with `rotation_trigger` (same licence, new key) |
+| Audit | `INNFACTORYHUB_AUDIT_CONTEXT` = CI run URL, commit, customer |
+| Take something away | End or suspend the licence, revoke the key — **in the Hub**. Terraform does not undo it; plans fail until `rotation_trigger` changes. |
+
+System keys are minted by staff in the portal (TOTP); an API key never creates one (`403 forbidden_key_minting`).
 
 ### Registering an environment in the innFactory AI Hub
 
@@ -72,7 +85,7 @@ output "license_key" {
 }
 ```
 
-The licence key (`lk_…`) is returned by the Hub only when the licence is issued; it stays in state and survives every in-place update (`max_users`, domains, edition, billing link …). Changing `environment_id`, `product` or `rotation_trigger` issues a new licence with a new key; destroy ends the licence. After `terraform import` the key is empty. See [docs/resources/license.md](docs/resources/license.md).
+The licence key (`lk_…`) is returned by the Hub only when the licence is issued or its key rotated; it stays in state and survives every in-place update (`max_users`, domains, edition, billing link …). Changing `rotation_trigger` rotates the key of the same licence in place (`key_id` changes, the old key is revoked at once); changing `environment_id` or `product` issues a new licence; destroy ends the licence. A licence ended in the Hub, or a key rotated there, is flagged and never silently re-issued. After `terraform import` the key is empty — rotate to get one. See [docs/resources/license.md](docs/resources/license.md).
 
 ### Resolving a tenant — five ways
 
@@ -88,31 +101,56 @@ Pass exactly one of these to `data "innfactoryhub_tenant"`:
 
 ## Security model
 
-This provider holds a **system-scope admin key** that can mint and revoke keys for every customer tenant. Treat it like root.
+This provider holds a **system-scope admin key**. On the AI Hub, use the narrow `["read", "licensing"]` key for applies and `["read_licensing"]` for plans; still treat it like a production credential.
 
-- The bearer is sent ONLY over HTTPS to `innfactory.cloud`, `innfactory.ai` or a subdomain of either (e.g. `hub.innfactory.cloud`, `hub.innfactory.ai`). Matching is per DNS label, so `innfactory.ai.evil.com` is refused. Any other endpoint is refused at provider configure time unless you opt out explicitly with `INNFACTORYHUB_INSECURE_ENDPOINT=1` (intended for local dev / staging-via-tunnel).
+- The bearer is sent ONLY over HTTPS to exactly `hub.innfactory.ai` or `hub.innfactory.cloud` (default port, bare origin). Other names in these domains, look-alikes such as `hub.innfactory.ai.evil.com`, credentials, paths and queries are refused at provider configure time. `INNFACTORYHUB_INSECURE_ENDPOINT=1` (local dev / staging-via-tunnel only) opens other https hosts, and plain http only to localhost/loopback.
+- Redirects are never followed — Go would keep `Authorization` on a same-host redirect, even to http — and a 3xx is an error.
 - 4xx/5xx response bodies are truncated to 512 bytes, and every error text is scrubbed for API keys (`ak_…`), licence keys (`lk_…`) and JWTs (`eyJ….….…`) before reaching Terraform diagnostics — so a misbehaving proxy that echoes the Authorization header into an error page can't leak a key into CI logs.
 - The HTTP transport pins TLS ≥ 1.2.
+- Every request can carry `X-Audit-Context` (`INNFACTORYHUB_AUDIT_CONTEXT` / `audit_context`): who ran Terraform ends up in the Hub's audit log. Sanitised to 256 printable ASCII characters, secrets redacted.
+- Creates carry an `Idempotency-Key` and are retried once with the same key after a lost answer — no duplicate (unbilled) licences.
+- Revocations in the Hub stick: ended licences, keys rotated in the portal, revoked or expired API keys stay in state with their status and are never re-issued without a `rotation_trigger` change.
 - The plaintext API key and the licence key live in Terraform state (as sensitive attributes). Use a backend with encryption-at-rest (GCS+CMEK, S3+KMS, Terraform Cloud). Licence files and signed licence tokens are never stored in state.
 
 ## Development
 
 ```bash
-go test ./...
+go vet ./...
+go test -race ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 go build .
 ```
 
-The resource tests run real `terraform` plans against an in-process fake Hub (`httptest`) via `terraform-plugin-testing`'s `resource.UnitTest`. They need a Terraform CLI: either on `PATH`, at `TF_ACC_TERRAFORM_PATH`, or the harness downloads the latest release. No real Hub is ever called; the tests set `INNFACTORYHUB_INSECURE_ENDPOINT=1` only for the loopback fake.
+The resource tests run real `terraform` plans against an in-process fake Hub (`httptest`) via `terraform-plugin-testing`'s `resource.UnitTest`. The fake mirrors the AI Hub's contract: key permissions (`licensing`, `read_licensing`, `read_maintenance`), key rotation, idempotent creates (and lost answers), out-of-band revocations. They need a Terraform CLI: either on `PATH`, at `TF_ACC_TERRAFORM_PATH`, or the harness downloads the latest release. No real Hub is ever called; the tests set `INNFACTORYHUB_INSECURE_ENDPOINT=1` only for the loopback fake.
 
 For local debugging, run `./terraform-provider-innfactoryhub --debug` and follow the printed `TF_REATTACH_PROVIDERS` instructions.
 
 ## Releases
 
-Tagged via `git tag v0.2.0 && git push --tags` — a manual step after approval. GoReleaser cross-compiles for darwin/linux/windows × amd64/arm64, signs the checksum file with GPG, and publishes to GitHub Releases. The public Terraform Registry polls that page automatically.
+Tagged via `git tag v0.2.0 && git push origin v0.2.0` — a manual step after approval. The `Release` workflow runs in the protected `release` environment: GoReleaser v2.19.0 (pinned) cross-compiles for darwin/linux/windows/freebsd, signs the checksum file with GPG and publishes to GitHub Releases; `actions/attest-build-provenance` attests the zips and the checksum file. The public Terraform Registry polls the releases page. Every action is pinned to a commit SHA; Dependabot proposes updates weekly.
+
+Verify a release binary's provenance:
+
+```bash
+gh attestation verify terraform-provider-innfactoryhub_0.2.0_linux_amd64.zip --repo innFactory/terraform-provider-innfactoryhub
+```
+
+### Repository settings (manual, once)
+
+These protect the release and cannot be set from the repository's files:
+
+1. **Environment `release`** (*Settings → Environments → New environment*):
+   - *Required reviewers*: at least one maintainer other than the person pushing the tag; enable *Prevent self-review*.
+   - *Deployment branches and tags*: *Selected branches and tags* → add the tag pattern `v*` only.
+   - Move the secrets `GPG_PRIVATE_KEY` and `GPG_PASSPHRASE` from repository secrets into this environment's secrets (and delete the repository-level copies), so only an approved release job can read them.
+2. **Tag ruleset** (*Settings → Rules → Rulesets → New tag ruleset*): target `v*`, enforcement *Active*, rules *Restrict creations*, *Restrict updates* and *Restrict deletions*; bypass list: the release maintainers only.
+3. **Branch protection for `main`**: pull request with at least one approval, required status checks `test`, `govulncheck`, `actionlint`.
+4. **Actions** (*Settings → Actions → General*): *Workflow permissions* = *Read repository contents*; do not allow Actions to create or approve pull requests; under *Actions permissions* enable *Require actions to be pinned to a full-length commit SHA*.
+5. **Security** (*Settings → Code security*): Dependabot alerts and Dependabot security updates on; private vulnerability reporting on.
 
 ## Keeping the provider in sync with the Hub API
 
-Both hub repos run `pnpm openapi:check` in CI, which fails when `docs/api/openapi.json` drifts from `openapi-spec.ts`: [innfactoryHUB](https://github.com/innFactory/innfactoryHUB/blob/main/docs/api/openapi.json) (tenants, API keys) and innfactoryAIHUB (`docs/api/openapi.json`: tenants, API keys, `/api/v1/admin/environments`, `/api/v1/admin/licenses`). When either spec changes in a way that affects this provider:
+Both hub repos run `pnpm openapi:check` in CI, which fails when `docs/api/openapi.json` drifts from `openapi-spec.ts`: [innfactoryHUB](https://github.com/innFactory/innfactoryHUB/blob/main/docs/api/openapi.json) (tenants, API keys) and innfactoryAIHUB (`docs/api/openapi.json`: tenants, API keys, `/api/v1/admin/environments`, `/api/v1/admin/licenses`, `/api/v1/admin/licenses/{id}/keys/rotate`). When either spec changes in a way that affects this provider:
 
 1. Re-read the diff in `docs/api/openapi.json`.
 2. Update the relevant resource/data-source shape here.

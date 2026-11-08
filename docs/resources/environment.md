@@ -19,6 +19,8 @@ The customer is named by **exactly one** of `tenant_id`, `azure_tenant_id`, `azu
 
 `terraform destroy` deletes the environment in the Hub. Re-running `apply` without changes sends no write request.
 
+The create carries an `Idempotency-Key`. If the Hub's answer is lost (connection drop, timeout, `5xx`), the provider sends the same request once more with the same key and the Hub returns the environment it already registered — no `409 environment_exists`, no second environment.
+
 The provider must point at the AI Hub (`endpoint = "https://hub.innfactory.ai"`); the innfactoryHUB on `innfactory.cloud` does not serve environments.
 
 ## Example Usage
@@ -78,6 +80,7 @@ Blank (whitespace-only) values are rejected at plan time.
 | `404 tenant_not_found` | No customer carries the identifier | Add the identifier to the customer in the Hub, or use `tenant_id` |
 | `409 ambiguous_lookup` | Several customers carry the identifier | Clean up the identifiers in the Hub, or use `tenant_id` |
 | `409 environment_exists` | The environment is already registered | `terraform import` it instead of creating it again |
+| `403 forbidden_read_only_key` | The admin key is read-only (`read_licensing`) | Apply with a `["read", "licensing"]` key |
 
 Nothing is written to state when the Hub rejects a create.
 
