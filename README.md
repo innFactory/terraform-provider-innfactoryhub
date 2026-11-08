@@ -40,7 +40,7 @@ Export `INNFACTORYHUB_ADMIN_KEY` with a system-scope admin key (mint one in *Hub
 |---|---|
 | Apply (CI, protected branch) | `INNFACTORYHUB_ADMIN_KEY` = system key `["read", "licensing"]`, at most **90 days** |
 | Plan (pull requests) | `INNFACTORYHUB_ADMIN_KEY` = system key `["read_licensing"]` (read-only; writes fail with `403 forbidden_read_only_key`) |
-| companyADMIN | `innfactoryhub_api_key`: `scope = "organization"`, `permissions = ["read_maintenance"]`, `expires_at` (≤ 24 months), `rotation_trigger` — see [docs/resources/api_key.md](docs/resources/api_key.md) |
+| companyADMIN | `innfactoryhub_api_key`: `scope = "organization"`, `permissions = ["read_maintenance"]`, `expires_at` (required, ≤ 24 months), `rotation_trigger` — see [docs/resources/api_key.md](docs/resources/api_key.md) |
 | Gateway licence | `innfactoryhub_license.license_key`; rotate with `rotation_trigger` (same licence, new key) |
 | Audit | `INNFACTORYHUB_AUDIT_CONTEXT` = CI run URL, commit, customer |
 | Take something away | End or suspend the licence, revoke the key — **in the Hub**. Terraform does not undo it; plans fail until `rotation_trigger` changes. |

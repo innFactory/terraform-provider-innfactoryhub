@@ -101,6 +101,9 @@ func TestAPIKeyRefusalsCarryHints(t *testing.T) {
 		{name: "licensing key mints only maintenance keys", key: testLicensingKey, body: `scope = "organization"
   tenant_id = "tnt_alpha"
   permissions = ["read"]`, wantErr: `(?s)403 forbidden_key_scope.*read_maintenance`},
+		{name: "licensing key mints maintenance keys only with expiry", key: testLicensingKey, body: `scope = "organization"
+  tenant_id = "tnt_alpha"
+  permissions = ["read_maintenance"]`, wantErr: `(?s)403 forbidden_key_scope.*with\s+an\s+expires_at`},
 		{name: "read_licensing key cannot write", key: testReadLicensingKey, body: `scope = "organization"
   tenant_id = "tnt_alpha"
   permissions = ["read_maintenance"]`, wantErr: `(?s)403 forbidden_read_only_key.*plans`},

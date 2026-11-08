@@ -119,7 +119,7 @@ func (r *apiKeyResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				ElementType: types.StringType,
 				Description: "Permissions. Organization keys: `read` (everything a customer user of the tenant sees) and/or `read_maintenance` " +
 					"(AI Hub: only `GET /customer/maintenance`, for companyADMIN — `read` next to it lifts that restriction). " +
-					"System keys: `read`, `read_accounting`, `write`; on the AI Hub also `licensing` and `read_licensing`. Changing it forces a new key.",
+					"System keys: `read`, `read_accounting`, `write`; on the AI Hub also `[\"read\", \"licensing\"]` (Terraform applies) and `[\"read_licensing\"]` alone (plans). Changing it forces a new key.",
 				Validators: []validator.Set{
 					setvalidator.SizeAtLeast(1),
 					setvalidator.ValueStringsAre(stringvalidator.OneOf(apiKeyPermissions...)),
@@ -239,7 +239,25 @@ func (r *apiKeyResource) ValidateConfig(ctx context.Context, req resource.Valida
 			resp.Diagnostics.AddAttributeError(permissions, "Organization-scope permission",
 				"read_maintenance is an organization-scope permission (companyADMIN); system keys use read, write, licensing or read_licensing.")
 		}
+		if detail := licensingCombination(perms); detail != "" {
+			resp.Diagnostics.AddAttributeError(permissions, "Invalid permission combination", detail)
+		}
 	}
+}
+
+// licensingCombination checks the AI Hub's rules for the Terraform keys:
+// ["read", "licensing"] to apply, ["read_licensing"] alone to plan.
+func licensingCombination(perms []string) string {
+	has := func(p string) bool { return slices.Contains(perms, p) }
+	switch {
+	case has("read_licensing") && len(perms) > 1:
+		return "read_licensing stands alone: it is the read-only key for plans and carries no other permission."
+	case has("licensing") && has("write"):
+		return "licensing and write exclude each other (write already grants everything); Terraform applies use [\"read\", \"licensing\"]."
+	case has("licensing") && !has("read"):
+		return "licensing needs read: use [\"read\", \"licensing\"]."
+	}
+	return ""
 }
 
 // knownElements lists the known strings of a set (unknown elements skipped).

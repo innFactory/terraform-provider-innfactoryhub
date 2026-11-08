@@ -77,10 +77,10 @@ func stringsOf(ctx context.Context, diags *diag.Diagnostics, s types.Set) []stri
 // permissions on the AI Hub.
 var commonHints = map[string]string{
 	"forbidden_key_scope": "The admin key's permissions do not cover this request. A key with [\"read\", \"licensing\"] manages environments, licences " +
-		"(incl. key rotation), the tenant lookup and companyADMIN keys (organization, [\"read_maintenance\"], expires_at at most 24 months ahead) — nothing else.",
+		"(incl. key rotation), the tenant lookup and companyADMIN keys — organization, [\"read_maintenance\"], with an expires_at at most 24 months ahead — nothing else.",
 	"forbidden_key_minting": "API keys cannot create system keys in the AI Hub. Create system keys in the portal (staff sign-in with TOTP); " +
 		"Terraform manages organization keys only.",
-	"forbidden_read_only_key": "The admin key is read-only (e.g. [\"read_licensing\"], meant for plans in pull requests). " +
+	"forbidden_read_only_key": "The admin key is read-only ([\"read_licensing\"], meant for plans in pull requests, or [\"read_maintenance\"]). " +
 		"Apply with a key that has [\"read\", \"licensing\"].",
 	"invalid_api_key": "The Hub does not accept the admin key: it is unknown to this Hub, revoked or expired. Check INNFACTORYHUB_ADMIN_KEY and the endpoint.",
 }

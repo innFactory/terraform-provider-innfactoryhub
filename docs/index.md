@@ -89,7 +89,7 @@ Which key:
 
 | Hub | Apply | Plan (e.g. pull requests) |
 |---|---|---|
-| innFactory AI Hub | `["read", "licensing"]` — environments, licences, key rotation, tenant lookup, companyADMIN keys; nothing else (`403 forbidden_key_scope`) | `["read_licensing"]` — the same routes, read-only; writes fail with `403 forbidden_read_only_key` |
+| innFactory AI Hub | `["read", "licensing"]` — environments, licences, key rotation, tenant lookup, companyADMIN keys (`["read_maintenance"]` with `expires_at`); nothing else (`403 forbidden_key_scope`) | `["read_licensing"]` alone — the same routes, read-only; writes fail with `403 forbidden_read_only_key` |
 | innfactoryHUB | a key with `write` | a key with `read` |
 
 On the AI Hub, staff mint these system keys in the portal (*Stammdaten → API-Keys*, sign-in with TOTP); no API key can create a system key (`403 forbidden_key_minting`). System keys expire after at most 12 months; keep automation keys short — **at most 90 days** for the apply key. The plaintext is shown exactly once.
@@ -115,7 +115,7 @@ Applying with the read-only key fails with `403 forbidden_read_only_key` and a h
 
 ## Audit context
 
-Set `INNFACTORYHUB_AUDIT_CONTEXT` (or the provider attribute `audit_context`) to record who ran Terraform. The provider sends it as `X-Audit-Context` on every request and the Hub stores it with each change in its audit log. It is reduced to printable ASCII on one line (line breaks become spaces, other characters `?`), anything that looks like a key or token is redacted, and it is cut to 256 characters. In CI, put the run, the commit and the customer in it:
+Set `INNFACTORYHUB_AUDIT_CONTEXT` (or the provider attribute `audit_context`) to record who ran Terraform. The provider sends it as `X-Audit-Context` on every request and the AI Hub stores it as `audit_context` with each change in its audit log (for API-key callers; it is never echoed back). It is reduced to printable ASCII on one line (line breaks become spaces, other characters `?`), anything that looks like a key or token is redacted, and it is cut to 256 characters. In CI, put the run, the commit and the customer in it:
 
 ```yaml
 # GitHub Actions

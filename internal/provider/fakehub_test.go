@@ -198,8 +198,8 @@ func (h *fakeHub) middleware(next http.Handler) http.Handler {
 			herr.write(w)
 			return
 		}
-		if !fakeAuditContext.MatchString(audit) {
-			writeError(w, http.StatusBadRequest, "bad_request", "X-Audit-Context: at most 256 printable ASCII characters")
+		if _, sent := r.Header["X-Audit-Context"]; sent && !fakeAuditContext.MatchString(audit) {
+			writeError(w, http.StatusBadRequest, "invalid_audit_context", "X-Audit-Context: 1–256 printable ASCII characters, no line breaks")
 			return
 		}
 		r = r.WithContext(context.WithValue(r.Context(), callerKey{}, caller))
@@ -214,9 +214,9 @@ func (h *fakeHub) middleware(next http.Handler) http.Handler {
 	})
 }
 
-// fakeAuditContext is the Hub's rule for X-Audit-Context: at most 256
-// printable ASCII characters, no line breaks.
-var fakeAuditContext = regexp.MustCompile(`^[\x20-\x7e]{0,256}$`)
+// fakeAuditContext is the Hub's rule for X-Audit-Context (API-key callers):
+// 1–256 printable ASCII characters, no line breaks.
+var fakeAuditContext = regexp.MustCompile(`^[\x20-\x7e]{1,256}$`)
 
 // --- inspection helpers (all lock-protected) ---
 
@@ -578,7 +578,7 @@ var fakeUUID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89
 func fakeIdempotencyKey(r *http.Request) (string, *fakeHTTPError) {
 	k := r.Header.Get("Idempotency-Key")
 	if k != "" && !fakeUUID.MatchString(k) {
-		return "", badRequest("Idempotency-Key must be a UUID")
+		return "", &fakeHTTPError{status: http.StatusBadRequest, code: "invalid_idempotency_key", message: "Idempotency-Key must be a UUID"}
 	}
 	return k, nil
 }

@@ -19,7 +19,7 @@ Error: API key revoked in the Hub – change rotation_trigger to mint a new one
 
 Change `rotation_trigger` to mint a new key on purpose, or remove the resource from the configuration to retire it. To take a key away from a customer installation, revoke it in the Hub — Terraform does not undo that.
 
-On the AI Hub, Terraform manages **organization** keys: an API key can never create a system key there (`403 forbidden_key_minting`); staff mint system keys in the portal (with TOTP). With a `["read", "licensing"]` admin key the provider may create exactly the companyADMIN key: `scope = "organization"`, `permissions = ["read_maintenance"]`, `expires_at` at most 24 months ahead.
+On the AI Hub, Terraform manages **organization** keys: an API key can never create a system key there (`403 forbidden_key_minting`); staff mint system keys in the portal (with TOTP). With a `["read", "licensing"]` admin key the provider may create exactly the companyADMIN key: `scope = "organization"`, `permissions = ["read_maintenance"]` and an `expires_at` (required for this key, at most 24 months ahead) — anything else is `403 forbidden_key_scope`.
 
 ## Example Usage
 
@@ -92,8 +92,10 @@ output "innfactoryhub_api_key" {
   | `read_maintenance` | organization | AI Hub: only `GET /customer/maintenance` (companyADMIN) — unless `read` is set too |
   | `write` | system | Everything |
   | `read_accounting` | system | Read like accounting |
-  | `licensing` | system | AI Hub, together with `read`: environments, licences, key rotation, tenant lookup, companyADMIN keys — for Terraform applies |
-  | `read_licensing` | system | AI Hub: the same routes, read-only — for Terraform plans |
+  | `licensing` | system | AI Hub, only as `["read", "licensing"]` (never with `write`): environments, licences, key rotation, tenant lookup, companyADMIN keys — for Terraform applies |
+  | `read_licensing` | system | AI Hub, alone: the same routes, read-only — for Terraform plans |
+
+  The provider rejects other combinations of `licensing` and `read_licensing` at plan time, and `licensing`/`read_licensing` on organization keys (the Hub: `400 forbidden_org_licensing`).
 
 ### Optional
 
@@ -114,8 +116,9 @@ output "innfactoryhub_api_key" {
 | Hub answer | Meaning | Fix |
 |---|---|---|
 | `403 forbidden_key_minting` | API keys cannot create system keys (AI Hub) | Mint system keys in the portal; manage organization keys with Terraform |
-| `403 forbidden_key_scope` | The admin key's permissions do not cover the request (e.g. a `licensing` key creating anything but a `read_maintenance` key) | Use the companyADMIN shape above, or a broader admin key |
-| `403 forbidden_read_only_key` | The admin key is read-only (`read_licensing`) | Apply with `["read", "licensing"]` |
+| `403 forbidden_key_scope` | The admin key's permissions do not cover the request (e.g. a `licensing` key creating anything but a `read_maintenance` key with `expires_at`) | Use the companyADMIN shape above, or a broader admin key |
+| `403 forbidden_read_only_key` | The admin key is read-only (`read_licensing`, `read_maintenance`) | Apply with `["read", "licensing"]` |
+| `400 forbidden_org_licensing` | `licensing` or `read_licensing` on an organization key | Caught at plan time; system keys only |
 | `400 bad_request` with `details.max_expires_at` | `expires_at` beyond the limit | Choose an earlier `expires_at` |
 
 ## Import

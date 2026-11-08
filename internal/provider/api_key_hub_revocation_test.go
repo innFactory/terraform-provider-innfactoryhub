@@ -236,31 +236,37 @@ func TestAPIKeyPermissionValidation(t *testing.T) {
 	}{
 		{name: "licensing on an organization key", body: `scope = "organization"
   tenant_id = "tnt_alpha"
-  permissions = ["read", "licensing"]`, wantErr: `(?s)licensing.*system`},
+  permissions = ["read", "licensing"]`, wantErr: `(?s)Error: System-scope permission.*"licensing" is a system-scope permission`},
 		{name: "read_licensing on an organization key", body: `scope = "organization"
   tenant_id = "tnt_alpha"
-  permissions = ["read_licensing"]`, wantErr: `(?s)read_licensing.*system`},
+  permissions = ["read_licensing"]`, wantErr: `(?s)Error: System-scope permission.*"read_licensing" is a system-scope permission`},
 		{name: "read_maintenance on a system key", body: `scope = "system"
-  permissions = ["read_maintenance"]`, wantErr: `(?s)read_maintenance.*organization`},
+  permissions = ["read_maintenance"]`, wantErr: `(?s)Error: Organization-scope permission.*read_maintenance is an organization-scope`},
 		{name: "write on an organization key", body: `scope = "organization"
   tenant_id = "tnt_alpha"
-  permissions = ["write"]`, wantErr: `(?s)write.*system`},
+  permissions = ["write"]`, wantErr: `(?s)Error: System-scope permission.*"write" is a system-scope permission`},
 		{name: "organization key without tenant", body: `scope = "organization"
-  permissions = ["read_maintenance"]`, wantErr: `(?s)tenant_id`},
+  permissions = ["read_maintenance"]`, wantErr: `(?s)Error: tenant_id required`},
 		{name: "system key with tenant", body: `scope = "system"
   tenant_id = "tnt_alpha"
-  permissions = ["read_licensing"]`, wantErr: `(?s)tenant_id`},
+  permissions = ["read_licensing"]`, wantErr: `(?s)Error: tenant_id forbidden`},
+		{name: "read_licensing with other permissions", body: `scope = "system"
+  permissions = ["read", "read_licensing"]`, wantErr: `(?s)Error: Invalid permission combination.*read_licensing stands alone`},
+		{name: "licensing without read", body: `scope = "system"
+  permissions = ["licensing"]`, wantErr: `(?s)Error: Invalid permission combination.*licensing needs read`},
+		{name: "licensing with write", body: `scope = "system"
+  permissions = ["read", "write", "licensing"]`, wantErr: `(?s)Error: Invalid permission combination.*licensing and write exclude each other`},
 		{name: "unknown permission", body: `scope = "organization"
   tenant_id = "tnt_alpha"
-  permissions = ["admin"]`, wantErr: `(?s)permissions.*value must be one of`},
+  permissions = ["admin"]`, wantErr: `(?s)Error: Invalid Attribute Value Match.*permissions.*value must be one of`},
 		{name: "unknown scope", body: `scope = "tenant"
-  permissions = ["read"]`, wantErr: `(?s)scope.*value must be one of`},
+  permissions = ["read"]`, wantErr: `(?s)Error: Invalid Attribute Value Match.*scope.*value must be one of`},
 		{name: "no permission", body: `scope = "system"
-  permissions = []`, wantErr: `(?s)permissions.*at least 1`},
+  permissions = []`, wantErr: `(?s)Error: Invalid Attribute Value.*permissions.*at least 1`},
 		{name: "expires_at not RFC 3339", body: `scope = "organization"
   tenant_id = "tnt_alpha"
   permissions = ["read_maintenance"]
-  expires_at = "2027-01-01"`, wantErr: `(?s)expires_at.*RFC 3339`},
+  expires_at = "2027-01-01"`, wantErr: `(?s)Error: Invalid timestamp.*RFC 3339`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

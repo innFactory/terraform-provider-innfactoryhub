@@ -15,14 +15,16 @@ import (
 //   - licensing keys reach only environments, licences (incl. key
 //     rotation), GET /tenants/lookup and organization keys; anything else is
 //     403 forbidden_key_scope. They create organization keys only as
-//     ["read_maintenance"] and list and revoke organization keys only.
+//     ["read_maintenance"] with expires_at, and list, revoke and delete
+//     organization keys only.
 //   - read_licensing keys: GET on the same routes; writes are 403
 //     forbidden_read_only_key
 //   - no API key creates a system key (403 forbidden_key_minting) unless the
 //     fake plays innfactoryHUB (mintSystemKeys)
 //   - organization keys: read and/or read_maintenance, optional expires_at
 //     at most 24 months ahead; system keys expire after at most 12 months
-//     (default 12 months)
+//     (default 12 months); licensing only as ["read", "licensing"],
+//     read_licensing alone
 
 // Bearers the fake Hub accepts besides testAdminKey.
 const (
@@ -178,7 +180,13 @@ func fakeKeyRules(scope string, tenantID *string, perms []string) *fakeHTTPError
 	case scope == "organization" && has("write"):
 		return &fakeHTTPError{status: http.StatusBadRequest, code: "forbidden_org_write", message: "Organization-scoped keys are read-only for now"}
 	case scope == "organization" && (has("licensing") || has("read_licensing")):
-		return &fakeHTTPError{status: http.StatusBadRequest, code: "forbidden_org_licensing", message: "licensing is a system-scope permission"}
+		return &fakeHTTPError{status: http.StatusBadRequest, code: "forbidden_org_licensing", message: "licensing and read_licensing are system-scope permissions"}
+	case has("read_licensing") && len(perms) > 1:
+		return badRequest("read_licensing keys carry no other permission")
+	case has("licensing") && !has("read"):
+		return badRequest("licensing keys need read")
+	case has("licensing") && has("write"):
+		return badRequest("licensing and write are mutually exclusive (write already grants everything)")
 	case scope == "system" && has("read_maintenance"):
 		return badRequest("read_maintenance is an organization-scope permission")
 	}
@@ -236,8 +244,8 @@ func (h *fakeHub) createAPIKey(w http.ResponseWriter, r *http.Request) {
 		(&fakeHTTPError{status: http.StatusForbidden, code: "forbidden_key_minting", message: "System keys can only be created by staff signed in with TOTP"}).write(w)
 		return
 	}
-	if caller.licensingOnly() && (body.Scope != "organization" || !slices.Equal(body.Permissions, []string{"read_maintenance"})) {
-		(&fakeHTTPError{status: http.StatusForbidden, code: "forbidden_key_scope", message: "licensing keys create organization keys with read_maintenance only"}).write(w)
+	if caller.licensingOnly() && (!slices.Equal(body.Permissions, []string{"read_maintenance"}) || body.ExpiresAt == nil) {
+		(&fakeHTTPError{status: http.StatusForbidden, code: "forbidden_key_scope", message: "licensing keys create only organization keys with read_maintenance and an expiry"}).write(w)
 		return
 	}
 	if herr := fakeKeyRules(body.Scope, body.TenantID, body.Permissions); herr != nil {
