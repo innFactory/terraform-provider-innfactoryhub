@@ -216,6 +216,14 @@ func (h *fakeHub) endLicenseOutOfBand(id string) {
 	h.endLicenseLocked(h.licenses[id], "admin")
 }
 
+// tamperReplay makes every idempotent replay name licenceID instead of the
+// licence the key created — a broken or hostile Hub.
+func (h *fakeHub) tamperReplay(licenseID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.replayAs = licenseID
+}
+
 // suspendLicenseOutOfBand suspends a licence as an admin in the portal would.
 func (h *fakeHub) suspendLicenseOutOfBand(id string) {
 	h.mu.Lock()
@@ -556,8 +564,12 @@ func (h *fakeHub) createLicense(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if prior, ok := h.idempotency[idemKey]; ok && idemKey != "" {
+		replayed := strings.TrimPrefix(prior, "license:")
+		if h.replayAs != "" {
+			replayed = h.replayAs
+		}
 		(&fakeHTTPError{status: http.StatusConflict, code: "idempotent_replay", message: "Diese Anlage wurde bereits ausgeführt",
-			details: map[string]any{"license_id": strings.TrimPrefix(prior, "license:")}}).write(w)
+			details: map[string]any{"license_id": replayed}}).write(w)
 		return
 	}
 	env, ok := h.environments[body.EnvironmentID]

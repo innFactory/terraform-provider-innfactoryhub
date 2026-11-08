@@ -562,16 +562,44 @@ func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest
 		return
 	}
 
-	// A lost response must not duplicate the licence (SEC-014): before the
-	// retry with the same Idempotency-Key, look up what exists; the Hub
-	// answers the retry of an issued licence with 409 idempotent_replay.
+	// At most one running licence per environment and product: a running
+	// one (e.g. issued by an earlier apply whose answer was lost) is never
+	// issued a second time; the operator adopts or ends it (SEC-014).
 	envID, product := plan.EnvironmentID.ValueString(), plan.Product.ValueString()
+	running, err := r.runningLicenses(ctx, envID, product)
+	if err != nil {
+		failCreate(ctx, resp, "Create licence failed", fmt.Sprintf("Looking up the running licences of environment %s failed: %s",
+			envID, withHint(err, licenseHints)))
+		return
+	}
+	if len(running) > 0 {
+		failCreate(ctx, resp, "Licence already running for this environment and product",
+			fmt.Sprintf("Environment %s already has a running %s licence: %s. Terraform issues at most one and never takes one over on its own, "+
+				"so a licence issued by an earlier apply (e.g. one whose answer was lost) is not issued twice. Adopt it with "+
+				"`terraform import <address> <license_id>` and change rotation_trigger to get its key into state, or end it in the portal, then apply again.",
+				envID, product, strings.Join(running, ", ")))
+		return
+	}
+
+	// Within this create, a lost answer is retried with the same
+	// Idempotency-Key after another lookup; the Hub answers the retry of an
+	// issued licence with 409 idempotent_replay.
 	var existing []string
 	var env envelope[licenseCreateResponse]
 	retried, err := r.client.create(ctx, licensesPath, body, &env, func() {
-		existing = r.runningLicenses(ctx, envID, product)
+		if ids, lerr := r.runningLicenses(ctx, envID, product); lerr == nil {
+			existing = ids
+		} else {
+			tflog.Warn(ctx, "license_lookup_failed", map[string]any{"environment_id": envID, "error": lerr.Error()})
+		}
 	})
 	if id, ok := replayedLicense(err); ok {
+		if !retried {
+			failCreate(ctx, resp, "Create licence failed", fmt.Sprintf("%s\n\nThe Hub answered the first attempt with a replay of licence %s, "+
+				"but a replay is only possible after a retry with the same Idempotency-Key. Terraform does not adopt that licence or rotate its key.",
+				withHint(err, licenseHints), id))
+			return
+		}
 		r.adopt(ctx, &plan, id, resp)
 		return
 	}
@@ -579,11 +607,12 @@ func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest
 		msg := withHint(err, licenseHints)
 		if outcomeUnknown(ctx, err) {
 			msg += "\n\n" + fmt.Sprintf("The Hub did not answer twice, so the outcome is unknown: it may have issued the licence. "+
-				"Running licences of environment %s for %s: %s. Check the environment in the portal, then adopt the licence with "+
-				"`terraform import <address> <license_id>` (rotate its key with rotation_trigger) or end it, and apply again.",
+				"Running licences of environment %s for %s: %s. Nothing was stored in state. Check the environment in the portal, then adopt the licence with "+
+				"`terraform import <address> <license_id>` (rotate its key with rotation_trigger) or end it, and apply again — "+
+				"while it runs, the next apply refuses to issue a second one.",
 				envID, product, listOrNone(existing))
 		}
-		resp.Diagnostics.AddError("Create licence failed", msg)
+		failCreate(ctx, resp, "Create licence failed", msg)
 		return
 	}
 	if retried && len(existing) > 0 {
@@ -596,6 +625,13 @@ func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest
 	plan.fillComputed(ctx, &resp.Diagnostics, env.Data.License)
 	plan.setKey(env.Data.LicenseKey, licenseKeyID(env.Data.LicenseKey))
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+}
+
+// failCreate reports a failed create and makes sure nothing partial is
+// stored: the plan the framework pre-fills as state is dropped.
+func failCreate(ctx context.Context, resp *resource.CreateResponse, summary, detail string) {
+	resp.State.RemoveResource(ctx)
+	resp.Diagnostics.AddError(summary, detail)
 }
 
 // replayedLicense reads 409 idempotent_replay: the Hub had already issued
@@ -614,42 +650,49 @@ func replayedLicense(err error) (string, bool) {
 	return details.LicenseID, true
 }
 
-// adopt takes over the licence an earlier attempt of this create issued and
-// rotates its key: the key of the lost response is revoked, the new one is
-// stored. Without a rotation the licence is adopted with no key.
+// adopt takes over the licence the first attempt of this create issued,
+// after checking that it is what was asked for (environment, product, not
+// ended), and rotates its key: the key of the lost answer is revoked, the
+// new one is stored. Any failure is an error and leaves state empty.
 func (r *licenseResource) adopt(ctx context.Context, plan *licenseModel, id string, resp *resource.CreateResponse) {
 	var got envelope[licenseResponse]
 	if err := r.client.do(ctx, http.MethodGet, licensePath(id), nil, nil, &got); err != nil {
-		resp.Diagnostics.AddError("Create licence failed", fmt.Sprintf("The Hub had already issued licence %s for this apply (its answer was lost), "+
-			"but reading it failed: %s\n\nAdopt it with `terraform import <address> %s`.", id, withHint(err, licenseHints), id))
+		failCreate(ctx, resp, "Create licence failed", fmt.Sprintf("The Hub reports licence %s as issued for this apply (its answer was lost), "+
+			"but reading it failed: %s\n\nNothing was stored in state. Adopt it with `terraform import <address> %s`.", id, withHint(err, licenseHints), id))
 		return
 	}
-	plan.fillComputed(ctx, &resp.Diagnostics, got.Data.License)
+	l := got.Data.License
+	if l.EnvironmentID != plan.EnvironmentID.ValueString() || l.Product != plan.Product.ValueString() || l.Status == licenseStatusEnded {
+		failCreate(ctx, resp, "Create licence failed", fmt.Sprintf("The Hub reports licence %s as the replay of this create, but it is a %s licence "+
+			"of environment %s with status %s — not the %s licence of environment %s that was requested. Terraform does not adopt it or rotate "+
+			"its key. Check the environment in the portal.", id, l.Product, l.EnvironmentID, l.Status, plan.Product.ValueString(), plan.EnvironmentID.ValueString()))
+		return
+	}
 
 	var rot envelope[licenseKeyRotation]
 	if err := r.client.do(ctx, http.MethodPost, licensePath(id)+"/keys/rotate", nil, struct{}{}, &rot); err != nil {
-		plan.LicenseKey, plan.KeyID, plan.KeyStatus = types.StringNull(), types.StringNull(), types.StringNull()
-		resp.Diagnostics.AddWarning("Licence adopted without key",
-			fmt.Sprintf("The Hub had already issued licence %s for this apply, but its answer with the key was lost, and rotating the key failed: %s\n\n"+
-				"license_key is empty. Change rotation_trigger to rotate the key and store the new one.", id, withHint(err, licenseHints)))
-	} else {
-		plan.setKey(rot.Data.LicenseKey, rot.Data.Key.KeyID)
-		resp.Diagnostics.AddWarning("Licence adopted after a lost answer",
-			fmt.Sprintf("The Hub had already issued licence %s for this apply, but its answer with the key was lost. "+
-				"Terraform adopted the licence and rotated its key: the lost key is revoked, the new one is in state.", id))
+		failCreate(ctx, resp, "Create licence failed", fmt.Sprintf("The Hub had already issued licence %s for this apply, but its answer with the key "+
+			"was lost, and rotating its key failed: %s\n\nNothing was stored in state. Adopt the licence with `terraform import <address> %s` and "+
+			"change rotation_trigger to get a key, or end it in the portal; while it runs, the next apply refuses to issue a second one.",
+			id, withHint(err, licenseHints), id))
+		return
 	}
+	plan.fillComputed(ctx, &resp.Diagnostics, l)
+	plan.setKey(rot.Data.LicenseKey, rot.Data.Key.KeyID)
+	resp.Diagnostics.AddWarning("Licence adopted after a lost answer",
+		fmt.Sprintf("The Hub had already issued licence %s for this apply, but its answer with the key was lost. "+
+			"Terraform adopted the licence and rotated its key: the lost key is revoked, the new one is in state.", id))
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
 // runningLicenses lists the licences of an environment and product that are
-// not ended; nil when the lookup fails (it only informs diagnostics).
-func (r *licenseResource) runningLicenses(ctx context.Context, envID, product string) []string {
+// not ended.
+func (r *licenseResource) runningLicenses(ctx context.Context, envID, product string) ([]string, error) {
 	var env envelope[struct {
 		Licenses []licenseDTO `json:"licenses"`
 	}]
 	if err := r.client.do(ctx, http.MethodGet, licensesPath, url.Values{"environment_id": {envID}}, nil, &env); err != nil {
-		tflog.Warn(ctx, "license_lookup_failed", map[string]any{"environment_id": envID, "error": err.Error()})
-		return nil
+		return nil, err
 	}
 	var ids []string
 	for _, l := range env.Data.Licenses {
@@ -658,7 +701,7 @@ func (r *licenseResource) runningLicenses(ctx context.Context, envID, product st
 		}
 	}
 	slices.Sort(ids)
-	return ids
+	return ids, nil
 }
 
 func listOrNone(ids []string) string {

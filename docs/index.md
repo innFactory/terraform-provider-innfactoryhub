@@ -145,7 +145,7 @@ For local development or a tunnel to staging, `INNFACTORYHUB_INSECURE_ENDPOINT=1
 
 The client never follows redirects (Go would keep the `Authorization` header on a same-host redirect, even to `http://`); a `3xx` answer is an error. TLS ≥ 1.2 is enforced. Error messages are scrubbed before they reach Terraform output: anything shaped like an API key (`ak_…`), a licence key (`lk_…`) or a JWT (`eyJ….….…`) is replaced by a placeholder.
 
-Creates of environments and licences carry an `Idempotency-Key`; a create whose answer was lost is retried once with the same key, so the Hub never registers an environment or issues a licence twice.
+Creates of environments and licences carry an `Idempotency-Key`; a create whose answer was lost is retried once with the same key, so one apply never registers an environment or issues a licence twice. Across applies, a licence create first looks up the running licences of the environment and product and stops if one runs already (adopt it with `terraform import`); the Hub refuses a second environment with the same domain (`409 environment_exists`).
 
 ## Schema
 

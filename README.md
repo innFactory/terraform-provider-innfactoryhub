@@ -108,7 +108,7 @@ This provider holds a **system-scope admin key**. On the AI Hub, use the narrow 
 - 4xx/5xx response bodies are truncated to 512 bytes, and every error text is scrubbed for API keys (`ak_…`), licence keys (`lk_…`) and JWTs (`eyJ….….…`) before reaching Terraform diagnostics — so a misbehaving proxy that echoes the Authorization header into an error page can't leak a key into CI logs.
 - The HTTP transport pins TLS ≥ 1.2.
 - Every request can carry `X-Audit-Context` (`INNFACTORYHUB_AUDIT_CONTEXT` / `audit_context`): who ran Terraform ends up in the Hub's audit log. Sanitised to 256 printable ASCII characters, secrets redacted.
-- Creates carry an `Idempotency-Key` and are retried once with the same key after a lost answer — no duplicate (unbilled) licences.
+- Creates carry an `Idempotency-Key` and are retried once with the same key after a lost answer — no duplicate within one apply. Across applies, a licence create first looks up the running licences of the environment and product and stops if one runs (adopt it with `terraform import`), so a lost answer is never issued twice.
 - Revocations in the Hub stick: ended licences, keys rotated in the portal, revoked or expired API keys stay in state with their status and are never re-issued without a `rotation_trigger` change.
 - The plaintext API key and the licence key live in Terraform state (as sensitive attributes). Use a backend with encryption-at-rest (GCS+CMEK, S3+KMS, Terraform Cloud). Licence files and signed licence tokens are never stored in state.
 

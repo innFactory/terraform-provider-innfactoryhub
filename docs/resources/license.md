@@ -32,7 +32,11 @@ To take a licence away, **end or suspend it in the Hub** (portal). Terraform doe
 
 ### Lost answers
 
-Every create carries an `Idempotency-Key`. When the Hub's answer is lost (connection drop, timeout, `5xx`), the provider looks up the running licences of the environment and product and sends the same request once more with the same key. The Hub answers `409 idempotent_replay` with the licence it already issued; the provider adopts that licence and rotates its key — the key of the lost answer is revoked, the new one is stored — and warns about it. If the retry is unanswered as well, the create fails with the running licences of the environment listed, instead of issuing a second (unbilled) licence.
+Terraform issues **at most one running licence per environment and product**. Before every create it looks up the environment's running licences; if one of that product runs already, the create stops with `Licence already running for this environment and product` and names it — adopt it with `terraform import` (then change `rotation_trigger` to get its key into state) or end it in the portal. This also covers an earlier apply whose answer was lost: it is never issued a second time.
+
+Within one apply, every create carries an `Idempotency-Key`. When the Hub's answer is lost (connection drop, timeout, `5xx`), the provider looks up the running licences again and sends the same request once more with the same key. The Hub answers `409 idempotent_replay` with the licence it already issued; the provider checks that this licence is the one asked for (environment, product, not ended), adopts it and rotates its key — the key of the lost answer is revoked, the new one is stored — and warns about it. A replay without a retry, a replay naming another licence, a failed rotation and a second unanswered attempt are errors; nothing is stored in state, and the error lists the running licences.
+
+The guarantee: no duplicate within one apply (Idempotency-Key), and no blind re-create across applies (the lookup). The key itself is not kept between applies.
 
 The provider must point at the AI Hub (`endpoint = "https://hub.innfactory.ai"`).
 
@@ -151,7 +155,8 @@ Hub rejections are shown with their code, the Hub's `details` and a hint. Nothin
 | `400 unbilled_max_exceeded` | End beyond the limit (`details.max_until_limit`) | Choose an earlier `unbilled_max_until` |
 | `400 unbilled_max_in_past` | End in the past | Choose today or later |
 | `409 license_ended` | The licence was ended in the Hub | Change `rotation_trigger` to issue a new licence, or remove the resource |
-| `409 idempotent_replay` | The Hub already issued the licence for this create (answer was lost) | Handled by the provider: it adopts the licence and rotates its key |
+| `409 idempotent_replay` | The Hub already issued the licence for this create (answer was lost) | Handled by the provider after its retry: it checks and adopts the licence and rotates its key |
+| `Licence already running for this environment and product` | A running licence of this product exists for the environment | `terraform import` it (then change `rotation_trigger`), or end it in the portal |
 | `403 forbidden_read_only_key` | The admin key is read-only (`read_licensing`) | Apply with a `["read", "licensing"]` key |
 | `403 forbidden_key_scope` | The admin key does not cover the request | Use a `["read", "licensing"]` key |
 

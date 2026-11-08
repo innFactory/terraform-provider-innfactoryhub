@@ -951,7 +951,9 @@ func TestLicenseCreateRejectedByHub(t *testing.T) {
 			if tc.seed {
 				pos, fifty := alphaPositionID, int64(50)
 				hub.seedLicense(fakeLicense{
-					LicenseID: "lic_holder000001", TenantID: alphaTenantID, EnvironmentID: alphaEnvID, Product: "ai-gateway",
+					// In Alpha's staging environment: a running licence in the
+					// target environment would stop the create before the Hub.
+					LicenseID: "lic_holder000001", TenantID: alphaTenantID, EnvironmentID: alphaStagingEnvID, Product: "ai-gateway",
 					ContractPositionID: &pos, Status: "active", Revision: 1,
 					Params: fakeLicenseParams{Domains: []string{"old.alpha.example"}, MaxUsers: &fifty, MaxInstances: 5, EditionID: "all"},
 				})
@@ -1027,7 +1029,7 @@ func TestLicenseSchemaKeepsKeySensitiveAndNoLicenseFile(t *testing.T) {
 func TestLicenseStateHoldsNoLicenseFile(t *testing.T) {
 	hub := newLicenseHub(t)
 	useFakeHubEnv(t)
-	allowed := regexp.MustCompile(`^(POST /api/v1/admin/licenses|(GET|PATCH|DELETE) /api/v1/admin/licenses/[A-Za-z0-9_-]+)$`)
+	allowed := regexp.MustCompile(`^((GET|POST) /api/v1/admin/licenses|(GET|PATCH|DELETE) /api/v1/admin/licenses/[A-Za-z0-9_-]+)$`)
 
 	noTokenInState := func(s *terraform.State) error {
 		for k, v := range s.RootModule().Resources[licAddr].Primary.Attributes {

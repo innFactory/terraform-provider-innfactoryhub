@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"regexp"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -73,10 +74,14 @@ func TestLicenseCreateLostResponseAdoptsLicense(t *testing.T) {
 						if err := sameIdempotencyKey(hub, "POST /api/v1/admin/licenses", 2); err != nil {
 							return err
 						}
+						// lookup → POST (answer lost) → lookup → POST (replay).
 						calls := hub.allCalls()
-						lookup := slices.Index(calls, "GET /api/v1/admin/licenses")
-						retry := slices.Index(calls[lookup+1:], "POST /api/v1/admin/licenses")
-						if lookup < 0 || retry < 0 {
+						first := slices.Index(calls, "POST /api/v1/admin/licenses")
+						if first < 0 || slices.Index(calls[:first], "GET /api/v1/admin/licenses") < 0 {
+							return fmt.Errorf("want a lookup by environment before the first POST, calls: %v", calls)
+						}
+						lookup := slices.Index(calls[first+1:], "GET /api/v1/admin/licenses")
+						if lookup < 0 || slices.Index(calls[first+1+lookup:], "POST /api/v1/admin/licenses") < 0 {
 							return fmt.Errorf("want a lookup by environment before the retry, calls: %v", calls)
 						}
 						return nil
@@ -127,8 +132,8 @@ func TestLicenseCreateDoesNotRetryRefusals(t *testing.T) {
 			ExpectError: regexp.MustCompile(`404 environment_not_found`),
 		}},
 	})
-	if got := hub.allCalls(); !slices.Equal(got, []string{"POST /api/v1/admin/licenses"}) {
-		t.Fatalf("calls %v, want exactly one POST", got)
+	if got := hub.allCalls(); !slices.Equal(got, []string{"GET /api/v1/admin/licenses", "POST /api/v1/admin/licenses"}) {
+		t.Fatalf("calls %v, want the lookup and exactly one POST", got)
 	}
 }
 
@@ -138,16 +143,29 @@ func TestLicenseCreateOutcomeUnknownIsReported(t *testing.T) {
 	hub := newLicenseHub(t)
 	useFakeHubEnv(t)
 	hub.failTimes(2, http.MethodPost, "/api/v1/admin/licenses", http.StatusGatewayTimeout, "gateway timeout")
+	cfg := hub.providerBlock() + fmt.Sprintf(trialLicense, alphaEnvID)
 	resource.UnitTest(t, resource.TestCase{
 		ProtoV6ProviderFactories: testProviderFactories(),
-		Steps: []resource.TestStep{{
-			Config:      hub.providerBlock() + fmt.Sprintf(trialLicense, alphaEnvID),
-			ExpectError: regexp.MustCompile(`(?s)Create licence failed.*504.*outcome.*terraform\s+import`),
-		}},
+		CheckDestroy:             checkLicensesEnded(hub),
+		Steps: []resource.TestStep{
+			{
+				Config:      cfg,
+				ExpectError: regexp.MustCompile(`(?s)Create licence failed.*504.*outcome.*terraform\s+import`),
+			},
+			{
+				// Nothing partial was stored: the next apply plans a plain create.
+				PreConfig: func() {
+					if n := len(hub.idempotencyKeysOf("POST /api/v1/admin/licenses")); n != 2 {
+						t.Errorf("%d POST(s), want 2", n)
+					}
+				},
+				Config: cfg,
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectResourceAction(licAddr, plancheck.ResourceActionCreate),
+				}},
+			},
+		},
 	})
-	if n := len(hub.idempotencyKeysOf("POST /api/v1/admin/licenses")); n != 2 {
-		t.Fatalf("%d POST(s), want 2", n)
-	}
 }
 
 // Environments: a lost response is retried with the same Idempotency-Key and
@@ -202,4 +220,147 @@ resource "innfactoryhub_license" "stg" {
 			},
 		}},
 	})
+}
+
+// A replay is only possible after a retry with the same key. A 409
+// idempotent_replay to the first attempt is not trusted: nothing is adopted,
+// no key of the named licence is rotated (P-1).
+func TestLicenseCreateIgnoresReplayWithoutRetry(t *testing.T) {
+	hub := newLicenseHub(t)
+	useFakeHubEnv(t)
+	foreign := seedBetaLicense(hub)
+	hub.failTimes(1, http.MethodPost, "/api/v1/admin/licenses", http.StatusConflict,
+		`{"error":{"code":"idempotent_replay","message":"replay","details":{"license_id":"`+foreign+`"}}}`)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		Steps: []resource.TestStep{{
+			Config:      hub.providerBlock() + fmt.Sprintf(trialLicense, alphaEnvID),
+			ExpectError: regexp.MustCompile(`(?s)Create licence failed.*409 idempotent_replay.*first\s+attempt`),
+		}},
+	})
+	checkForeignUntouched(t, hub, foreign)
+}
+
+// A replay that names a licence of another environment or product, or an
+// ended one, is refused before any rotation (P-1): a broken or hostile Hub
+// must not make Terraform revoke someone else's key.
+func TestLicenseCreateRefusesForeignReplay(t *testing.T) {
+	cases := []struct {
+		name    string
+		replay  func(hub *fakeHub) string
+		wantErr string
+	}{
+		{name: "other environment", replay: seedBetaLicense, wantErr: `env_beta_gw`},
+		{name: "other product", replay: func(h *fakeHub) string {
+			return seedLicenseIn(h, "lic_prices000001", alphaEnvID, "ai-prices", "active")
+		}, wantErr: `ai-prices`},
+		{name: "ended licence", replay: func(h *fakeHub) string {
+			return seedLicenseIn(h, "lic_ended0000001", alphaEnvID, "ai-gateway", "ended")
+		}, wantErr: `ended`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hub := newLicenseHub(t)
+			useFakeHubEnv(t)
+			foreign := tc.replay(hub)
+			hub.tamperReplay(foreign)
+			hub.dropResponses(1, "/api/v1/admin/licenses")
+
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testProviderFactories(),
+				Steps: []resource.TestStep{{
+					Config:      hub.providerBlock() + fmt.Sprintf(trialLicense, alphaEnvID),
+					ExpectError: regexp.MustCompile(`(?s)Create licence failed.*` + foreign + `.*` + tc.wantErr + `.*not\s+adopt`),
+				}},
+			})
+			checkForeignUntouched(t, hub, foreign)
+		})
+	}
+}
+
+// A failed rotation while adopting is an error, and nothing lands in state;
+// the next apply refuses to issue a second licence while the adopted one
+// runs and says how to take it over (P-4).
+func TestLicenseAdoptionWithoutKeyIsAnError(t *testing.T) {
+	hub := newLicenseHub(t)
+	useFakeHubEnv(t)
+	hub.dropResponses(1, "/api/v1/admin/licenses")
+	hub.failPath(http.MethodPost, "/keys/rotate", http.StatusServiceUnavailable, `{"error":{"code":"signing_unavailable","message":"later"}}`)
+	cfg := hub.providerBlock() + fmt.Sprintf(trialLicense, alphaEnvID)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config:      cfg,
+				ExpectError: regexp.MustCompile(`(?s)Create licence failed.*rotating.*503\s+signing_unavailable.*terraform\s+import`),
+			},
+			{
+				PreConfig:   func() { hub.failPath("", "", 0, "") },
+				Config:      cfg,
+				ExpectError: regexp.MustCompile(`(?s)Licence already running.*lic_\d+.*terraform\s+import`),
+			},
+		},
+	})
+	if ids := hub.licenseIDsByStatus(""); len(ids) != 1 {
+		t.Fatalf("licences %v, want exactly one", ids)
+	}
+}
+
+// Across applies, a running licence for the environment and product stops
+// the create before the Hub: a create whose answer was lost in an earlier
+// apply is never issued a second time (P-4).
+func TestLicenseCreateRefusesWhenOneIsRunning(t *testing.T) {
+	hub := newLicenseHub(t)
+	useFakeHubEnv(t)
+	running := seedLicenseIn(hub, "lic_running00001", alphaEnvID, "ai-gateway", "active")
+	seedLicenseIn(hub, "lic_otherprod001", alphaEnvID, "ai-prices", "active")
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		Steps: []resource.TestStep{{
+			Config:      hub.providerBlock() + fmt.Sprintf(trialLicense, alphaEnvID),
+			ExpectError: regexp.MustCompile(`(?s)Licence already running.*` + running + `.*terraform\s+import.*rotation_trigger`),
+		}},
+	})
+	if n := len(hub.idempotencyKeysOf("POST /api/v1/admin/licenses")); n != 0 {
+		t.Fatalf("%d POST(s), want none", n)
+	}
+}
+
+// seedBetaLicense seeds a running licence of another customer.
+func seedBetaLicense(h *fakeHub) string {
+	return seedLicenseIn(h, "lic_betaforeign1", betaEnvID, "ai-gateway", "active")
+}
+
+// seedLicenseIn seeds a licence with one key, as if issued in the portal.
+func seedLicenseIn(h *fakeHub, id, envID, product, status string) string {
+	tenant := alphaTenantID
+	if envID == betaEnvID {
+		tenant = betaTenantID
+	}
+	five := int64(5)
+	h.seedLicense(fakeLicense{
+		LicenseID: id, TenantID: tenant, EnvironmentID: envID, Product: product, Status: status, Revision: 1,
+		Unbilled: &fakeUnbilled{Reason: "trial", MaxUntil: fakeToday().AddDate(0, 0, 30).Format(isoDay)},
+		Params:   fakeLicenseParams{Domains: []string{"gpt.example.com"}, MaxUsers: &five, MaxInstances: 5, EditionID: "all"},
+	})
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.mintLicenseKeyLocked(id)
+	return id
+}
+
+// checkForeignUntouched asserts no key of the licence was rotated.
+func checkForeignUntouched(t *testing.T, hub *fakeHub, id string) {
+	t.Helper()
+	if keys := hub.issuedKeys(id); len(keys) != 1 {
+		t.Fatalf("licence %s has %d keys — its key was rotated", id, len(keys))
+	}
+	for _, c := range hub.writeCalls() {
+		if strings.Contains(c, "/keys/rotate") {
+			t.Fatalf("a rotation was sent: %v", hub.writeCalls())
+		}
+	}
 }

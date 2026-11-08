@@ -65,6 +65,8 @@ type fakeHub struct {
 	idempotency map[string]string
 	// idempotencyKeys lists the Idempotency-Key of every call ("" = none).
 	idempotencyKeys []string
+	// replayAs, when set, is the licence id every idempotent replay names.
+	replayAs string
 }
 
 type fakeTenant struct {
