@@ -337,3 +337,13 @@ func TestClientSendsAuditContext(t *testing.T) {
 		t.Fatalf("X-Audit-Context per request = %q", got)
 	}
 }
+
+// The missing-key error names the keys to use on the AI Hub.
+func TestMissingAdminKeyRecommendsLicensingKeys(t *testing.T) {
+	t.Parallel()
+	for _, want := range []string{`["read", "licensing"]`, `["read_licensing"]`, "INNFACTORYHUB_ADMIN_KEY"} {
+		if !strings.Contains(errMissingAdminKey.Error(), want) {
+			t.Errorf("missing-key error does not mention %s: %v", want, errMissingAdminKey)
+		}
+	}
+}

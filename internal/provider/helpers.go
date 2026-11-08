@@ -73,15 +73,32 @@ func stringsOf(ctx context.Context, diags *diag.Diagnostics, s types.Set) []stri
 	return out
 }
 
+// commonHints explain refusals any operation can meet: the admin key's
+// permissions on the AI Hub.
+var commonHints = map[string]string{
+	"forbidden_key_scope": "The admin key's permissions do not cover this request. A key with [\"read\", \"licensing\"] manages environments, licences " +
+		"(incl. key rotation), the tenant lookup and companyADMIN keys (organization, [\"read_maintenance\"], expires_at at most 24 months ahead) — nothing else.",
+	"forbidden_key_minting": "API keys cannot create system keys in the AI Hub. Create system keys in the portal (staff sign-in with TOTP); " +
+		"Terraform manages organization keys only.",
+	"forbidden_read_only_key": "The admin key is read-only (e.g. [\"read_licensing\"], meant for plans in pull requests). " +
+		"Apply with a key that has [\"read\", \"licensing\"].",
+	"invalid_api_key": "The Hub does not accept the admin key: it is unknown to this Hub, revoked or expired. Check INNFACTORYHUB_ADMIN_KEY and the endpoint.",
+}
+
 // withHint renders err for a diagnostic and, when the Hub answered with an
-// error code listed in hints, appends the matching remediation text.
+// error code listed in hints (or commonHints), appends the matching
+// remediation text.
 func withHint(err error, hints map[string]string) string {
 	msg := err.Error()
 	var ae *apiError
-	if errors.As(err, &ae) {
-		if hint, ok := hints[ae.Code]; ok {
-			msg += "\n\n" + hint
-		}
+	if !errors.As(err, &ae) {
+		return msg
+	}
+	if hint, ok := hints[ae.Code]; ok {
+		return msg + "\n\n" + hint
+	}
+	if hint, ok := commonHints[ae.Code]; ok {
+		return msg + "\n\n" + hint
 	}
 	return msg
 }

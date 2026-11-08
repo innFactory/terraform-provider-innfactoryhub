@@ -272,7 +272,7 @@ func (r *environmentResource) Read(ctx context.Context, req resource.ReadRequest
 		return
 	}
 	if err != nil {
-		resp.Diagnostics.AddError("Read environment failed", err.Error())
+		resp.Diagnostics.AddError("Read environment failed", withHint(err, environmentCreateHints))
 		return
 	}
 
@@ -318,7 +318,7 @@ func (r *environmentResource) Update(ctx context.Context, req resource.UpdateReq
 
 	body := environmentPatchBody{Name: plan.Name.ValueString(), Domain: plan.Domain.ValueString()}
 	if err := r.client.do(ctx, http.MethodPatch, environmentPath(state.ID.ValueString()), nil, body, nil); err != nil {
-		resp.Diagnostics.AddError("Update environment failed", err.Error())
+		resp.Diagnostics.AddError("Update environment failed", withHint(err, environmentCreateHints))
 		return
 	}
 
@@ -337,7 +337,7 @@ func (r *environmentResource) Delete(ctx context.Context, req resource.DeleteReq
 	}
 	err := r.client.do(ctx, http.MethodDelete, environmentPath(state.ID.ValueString()), nil, nil, nil)
 	if err != nil && !isNotFound(err) {
-		resp.Diagnostics.AddError("Delete environment failed", err.Error())
+		resp.Diagnostics.AddError("Delete environment failed", withHint(err, environmentCreateHints))
 	}
 }
 

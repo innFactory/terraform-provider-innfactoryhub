@@ -166,7 +166,8 @@ const maxBodyForError = 512
 
 // errMissingAdminKey is returned by every operation when neither
 // provider.admin_key nor INNFACTORYHUB_ADMIN_KEY is set.
-var errMissingAdminKey = errors.New("missing admin key: set provider.admin_key, or export INNFACTORYHUB_ADMIN_KEY with a system-scope key (`ak_…`, permission write) minted in the Hub admin UI")
+var errMissingAdminKey = errors.New("missing admin key: set provider.admin_key, or export INNFACTORYHUB_ADMIN_KEY with a system-scope key (`ak_…`) " +
+	"minted in the Hub admin UI — on the innFactory AI Hub [\"read\", \"licensing\"] to apply and [\"read_licensing\"] for plans, on innfactoryHUB one with write")
 
 func (c *httpClient) do(ctx context.Context, method, path string, query url.Values, body, out any) error {
 	if c.adminKey == "" {

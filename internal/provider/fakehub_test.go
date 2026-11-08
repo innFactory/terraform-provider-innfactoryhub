@@ -2,6 +2,7 @@ package provider
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -41,6 +42,9 @@ type fakeHub struct {
 	audits       []string // X-Audit-Context per call, "" when absent
 	bodies       map[string][]map[string]any
 	nextID       int
+	// mintSystemKeys lets API keys create system keys, as innfactoryHUB
+	// does; the AI Hub refuses (403 forbidden_key_minting).
+	mintSystemKeys bool
 	// errorBody, when set, is returned with errorStatus for every request
 	// whose method matches errorMethod ("" = every method) and whose path
 	// ends with errorPath ("" = every path).
@@ -71,17 +75,6 @@ type fakeEnvironment struct {
 	CreatedBy      string          `json:"created_by"`
 	CreatedAt      string          `json:"created_at"`
 	UpdatedAt      string          `json:"updated_at"`
-}
-
-type fakeAPIKey struct {
-	KeyID         string   `json:"key_id"`
-	Name          string   `json:"name"`
-	Scope         string   `json:"scope"`
-	TenantID      *string  `json:"tenant_id"`
-	Permissions   []string `json:"permissions"`
-	DisplayPrefix string   `json:"display_prefix"`
-	CreatedAt     string   `json:"created_at"`
-	RevokedAt     *string  `json:"revoked_at"`
 }
 
 // Seeded customers. tnt_alpha is reachable via every lookup kind;
@@ -127,6 +120,7 @@ func newFakeHub(t *testing.T) *fakeHub {
 	mux.HandleFunc("GET /api/v1/admin/api-keys", h.listAPIKeys)
 	mux.HandleFunc("POST /api/v1/admin/api-keys", h.createAPIKey)
 	mux.HandleFunc("POST /api/v1/admin/api-keys/{id}/revoke", h.revokeAPIKey)
+	mux.HandleFunc("DELETE /api/v1/admin/api-keys/{id}", h.deleteAPIKey)
 	mux.HandleFunc("GET /api/v1/admin/environments", h.listEnvironments)
 	mux.HandleFunc("POST /api/v1/admin/environments", h.createEnvironment)
 	mux.HandleFunc("GET /api/v1/admin/environments/{id}", h.getEnvironment)
@@ -170,15 +164,20 @@ func (h *fakeHub) middleware(next http.Handler) http.Handler {
 			_, _ = w.Write([]byte(errBody))
 			return
 		}
-		if r.Header.Get("Authorization") != "Bearer "+testAdminKey {
+		caller, ok := fakeCallers[r.Header.Get("Authorization")]
+		if !ok {
 			writeError(w, http.StatusUnauthorized, "invalid_api_key", "API key invalid")
+			return
+		}
+		if herr := caller.gate(r.Method, r.URL.Path); herr != nil {
+			herr.write(w)
 			return
 		}
 		if !fakeAuditContext.MatchString(audit) {
 			writeError(w, http.StatusBadRequest, "bad_request", "X-Audit-Context: at most 256 printable ASCII characters")
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), callerKey{}, caller)))
 	})
 }
 
@@ -288,18 +287,6 @@ func (h *fakeHub) failPath(method, suffix string, status int, raw string) {
 	h.errorMethod, h.errorPath, h.errorStatus, h.errorBody = method, suffix, status, raw
 }
 
-func (h *fakeHub) apiKeyIDs() []string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	var ids []string
-	for id, k := range h.apiKeys {
-		if k.RevokedAt == nil {
-			ids = append(ids, id)
-		}
-	}
-	return ids
-}
-
 // --- handlers (callers do NOT hold mu) ---
 
 var lookupFields = map[string]string{
@@ -371,55 +358,6 @@ func (h *fakeHub) lookupTenant(w http.ResponseWriter, r *http.Request) {
 	writeData(w, http.StatusOK, map[string]any{"tenant": map[string]any{
 		"tenant_id": t.TenantID, "legal_name": t.LegalName, "identifiers": ids,
 	}})
-}
-
-func (h *fakeHub) listAPIKeys(w http.ResponseWriter, _ *http.Request) {
-	h.mu.Lock()
-	keys := make([]fakeAPIKey, 0, len(h.apiKeys))
-	for _, k := range h.apiKeys {
-		keys = append(keys, *k)
-	}
-	h.mu.Unlock()
-	writeData(w, http.StatusOK, map[string]any{"keys": keys})
-}
-
-func (h *fakeHub) createAPIKey(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Name        string   `json:"name"`
-		Scope       string   `json:"scope"`
-		TenantID    *string  `json:"tenant_id"`
-		Permissions []string `json:"permissions"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	h.mu.Lock()
-	h.nextID++
-	id := fmt.Sprintf("KEY%09d", h.nextID)
-	k := &fakeAPIKey{
-		KeyID: id, Name: body.Name, Scope: body.Scope, TenantID: body.TenantID,
-		Permissions: body.Permissions, DisplayPrefix: "ak_" + id[:5], CreatedAt: nowISO(),
-	}
-	h.apiKeys[id] = k
-	created := *k
-	h.mu.Unlock()
-	writeData(w, http.StatusCreated, map[string]any{"key": created, "plaintext": "ak_" + id + ".plaintextsecret"})
-}
-
-func (h *fakeHub) revokeAPIKey(w http.ResponseWriter, r *http.Request) {
-	h.mu.Lock()
-	k, ok := h.apiKeys[r.PathValue("id")]
-	if ok && k.RevokedAt == nil {
-		at := nowISO()
-		k.RevokedAt = &at
-	}
-	h.mu.Unlock()
-	if !ok {
-		writeError(w, http.StatusNotFound, "api_key_not_found", "API key not found")
-		return
-	}
-	writeData(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (h *fakeHub) listEnvironments(w http.ResponseWriter, _ *http.Request) {
@@ -604,6 +542,16 @@ provider "innfactoryhub" {
   admin_key = %q
 }
 `, h.URL(), testAdminKey)
+}
+
+// providerBlockWithKey renders a provider configuration with another key.
+func (h *fakeHub) providerBlockWithKey(key string) string {
+	return fmt.Sprintf(`
+provider "innfactoryhub" {
+  endpoint  = %q
+  admin_key = %q
+}
+`, h.URL(), key)
 }
 
 // providerBlockWithoutKey points at the fake Hub but configures no key.

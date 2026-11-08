@@ -23,6 +23,7 @@ resource "innfactoryhub_api_key" "k" {
 // key instead of ending in the provider's "Update not supported" error.
 func TestAPIKeyPermissionChangeForcesReplacement(t *testing.T) {
 	hub := newFakeHub(t)
+	hub.allowSystemKeyMinting() // innfactoryHUB; the AI Hub refuses system keys from API keys
 	useFakeHubEnv(t)
 
 	var firstID string

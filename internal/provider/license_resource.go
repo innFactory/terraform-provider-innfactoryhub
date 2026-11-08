@@ -756,7 +756,7 @@ func (r *licenseResource) Delete(ctx context.Context, req resource.DeleteRequest
 	}
 	err := r.client.do(ctx, http.MethodDelete, licensePath(state.ID.ValueString()), nil, nil, nil)
 	if err != nil && !isNotFound(err) {
-		resp.Diagnostics.AddError("End licence failed", err.Error())
+		resp.Diagnostics.AddError("End licence failed", withHint(err, licenseHints))
 	}
 }
 

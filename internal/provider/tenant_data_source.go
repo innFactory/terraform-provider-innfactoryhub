@@ -99,11 +99,16 @@ func (d *tenantDataSource) Schema(_ context.Context, _ datasource.SchemaRequest,
 	}
 }
 
-func (d *tenantDataSource) Configure(_ context.Context, req datasource.ConfigureRequest, _ *datasource.ConfigureResponse) {
+func (d *tenantDataSource) Configure(_ context.Context, req datasource.ConfigureRequest, resp *datasource.ConfigureResponse) {
 	if req.ProviderData == nil {
 		return
 	}
-	d.client = req.ProviderData.(*httpClient)
+	client, ok := req.ProviderData.(*httpClient)
+	if !ok {
+		resp.Diagnostics.AddError("Unexpected provider data", fmt.Sprintf("expected *httpClient, got %T", req.ProviderData))
+		return
+	}
+	d.client = client
 }
 
 type tenantLookupResponse struct {
@@ -170,7 +175,7 @@ func (d *tenantDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 
 	var env envelope[tenantLookupResponse]
 	if err := d.client.do(ctx, "GET", "/api/v1/admin/tenants/lookup", q, nil, &env); err != nil {
-		resp.Diagnostics.AddError("Tenant lookup failed", err.Error())
+		resp.Diagnostics.AddError("Tenant lookup failed", withHint(err, nil))
 		return
 	}
 
