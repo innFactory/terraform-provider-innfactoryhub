@@ -2,7 +2,7 @@ module github.com/innFactory/terraform-provider-innfactoryhub
 
 go 1.22.0
 
-toolchain go1.22.2
+toolchain go1.26.8
 
 require (
 	github.com/hashicorp/terraform-plugin-framework v1.13.0
