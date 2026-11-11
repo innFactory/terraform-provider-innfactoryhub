@@ -41,7 +41,7 @@ Prepared for release; the tag `v0.2.0` is pushed manually after approval (GoRele
 
 - A missing admin key no longer fails provider configuration; it fails the first operation that calls the Hub (`missing admin key`). Allows count-gated secret reads in callers such as CompanyGPT.
 - A trailing slash on `endpoint` is tolerated.
-- Go 1.26.10 toolchain (`go 1.26.0`); terraform-plugin-framework v1.19.0, terraform-plugin-go v0.31.0, terraform-plugin-testing v1.16.0, terraform-plugin-framework-validators v0.19.0, terraform-plugin-log v0.11.0, golang.org/x/net v0.62.0, google.golang.org/grpc v1.85.0. Same 13 platforms as v0.1.0; `windows/arm` is excluded explicitly.
+- Go 1.26.11 toolchain (`go 1.26.0`); terraform-plugin-framework v1.19.0, terraform-plugin-go v0.31.0, terraform-plugin-testing v1.16.0, terraform-plugin-framework-validators v0.19.0, terraform-plugin-log v0.11.0, golang.org/x/net v0.62.0, google.golang.org/grpc v1.85.0. Same 13 platforms as v0.1.0; `windows/arm` is excluded explicitly.
 - Docs: CompanyGPT usage on the AI Hub (apply/plan keys, companyADMIN key with `time_rotating`, audit context in CI, revoking in the Hub), import examples; examples pin `~> 0.2.0`.
 
 **Fixed**
@@ -56,7 +56,7 @@ Prepared for release; the tag `v0.2.0` is pushed manually after approval (GoRele
 - SEC-009 — the admin key goes only to exactly `hub.innfactory.ai` and `hub.innfactory.cloud` (default port, bare origin); the opt-out needs `INNFACTORYHUB_INSECURE_ENDPOINT=1` plus `INNFACTORYHUB_INSECURE_ENDPOINT_HOST=<host>` and opens only that host (https, or http on loopback), with a warning on every configuration.
 - SEC-010 — the HTTP client follows no redirects; a 3xx is an error.
 - SEC-011 — key rotation no longer ends the licence (no gap without licence, no lost instance history or position link); keys rotated outside Terraform are detected.
-- SEC-012 — Go 1.26.10 (GO-2026-6809, crypto/x509) and dependencies without known vulnerabilities (govulncheck).
+- SEC-012 — Go 1.26.11 (GO-2026-6809, crypto/x509; GO-2026-6859, net/http) and dependencies without known vulnerabilities (govulncheck).
 - SEC-013 — `X-Audit-Context` attributes changes in the Hub's audit log to the CI run.
 - SEC-014 — a lost create answer no longer duplicates an unbilled licence: not within one apply (Idempotency-Key), not across applies (lookup of running licences before every create).
 - A replayed licence is adopted only after the provider's own retry and only if environment, product and status match — a broken or hostile Hub cannot make Terraform rotate another licence's key.
