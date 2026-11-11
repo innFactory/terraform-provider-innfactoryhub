@@ -395,7 +395,6 @@ func TestLicenseNoChangesMeansNoWrites(t *testing.T) {
 			"max_instances": "3",
 			"features":      `["mcp", "flows"]`,
 			"entitlements":  `["ai-prices"]`,
-			"air_gapped":    "true",
 		})},
 		{name: "air_gapped = false written out", attrs: gatewayLicense().with(licenseAttrs{"air_gapped": "false"})},
 	}
@@ -558,20 +557,6 @@ func TestLicenseUpdateInPlace(t *testing.T) {
 			to:    gatewayLicense().with(licenseAttrs{"entitlements": `["ai-prices"]`}),
 			patch: map[string]any{"params": map[string]any{"entitlements": []string{"ai-prices"}}},
 			check: resource.TestCheckTypeSetElemAttr(licAddr, "entitlements.*", "ai-prices"),
-		},
-		{
-			name: "air_gapped switched on", from: gatewayLicense(),
-			to:    gatewayLicense().with(licenseAttrs{"air_gapped": "true"}),
-			patch: map[string]any{"params": map[string]any{"air_gapped": true}},
-			check: resource.TestCheckResourceAttr(licAddr, "air_gapped", "true"),
-		},
-		{
-			// Only an explicit false switches it off; removing the attribute
-			// would leave the Hub's value (TestLicenseAirGappedSwitchedInPortal).
-			name: "air_gapped switched off", from: gatewayLicense().with(licenseAttrs{"air_gapped": "true"}),
-			to:    gatewayLicense().with(licenseAttrs{"air_gapped": "false"}),
-			patch: map[string]any{"params": map[string]any{"air_gapped": false}},
-			check: resource.TestCheckResourceAttr(licAddr, "air_gapped", "false"),
 		},
 		{
 			name:  "edition with configured features",
@@ -967,8 +952,6 @@ func TestLicenseCreateRejectedByHub(t *testing.T) {
 			wantErr: `(?s)400 unbilled_max_exceeded.*max_until_limit.*60\s+days`},
 		{name: "trial end in the past", attrs: trial.with(licenseAttrs{"unbilled_max_until": fmt.Sprintf("%q", yesterday)}),
 			wantErr: `(?s)400 unbilled_max_in_past.*today\s+or\s+later`},
-		{name: "air-gapped AI Prices licence", attrs: pricesLicense().with(licenseAttrs{"air_gapped": "true"}),
-			wantErr: `(?s)422 air_gapped_unsupported.*"product":"ai-prices".*only\s+for\s+ai-gateway`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

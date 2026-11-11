@@ -12,7 +12,7 @@ The `innfactoryhub` provider talks to both hubs — [innFactory Hub](https://hub
 - Minting and revoking **API keys** scoped to a tenant (`innfactoryhub_api_key`), e.g. the companyADMIN maintenance key — both hubs.
 - Resolving a tenant from a cloud handle (`data.innfactoryhub_tenant`) — useful when a deploy environment knows only its own GCP project / Azure subscription / AWS account — both hubs.
 - Registering **environments** (`innfactoryhub_environment`) — one CompanyGPT / AI Gateway installation per customer — AI Hub only.
-- Issuing **licences** (`innfactoryhub_license`) for an environment, with the licence key as a sensitive value — AI Hub only. Air-gap operation (`air_gapped`; licence files for a gateway without internet access) stays in the portal unless the configuration sets it.
+- Issuing **licences** (`innfactoryhub_license`) for an environment, with the licence key as a sensitive value — AI Hub only. Air-gap operation (`air_gapped`; licence files for a gateway without internet access) is switched on by staff in the portal; Terraform can keep it or switch it off.
 
 Use one provider block per hub; add an `alias` when a configuration talks to both.
 
@@ -137,7 +137,7 @@ To take something away from a customer installation, do it in the Hub — Terraf
 - **Rotate or revoke a licence key** in the portal. Plans fail with `key_status = "revoked"` until `rotation_trigger` changes (which rotates the key of the same licence).
 - **Revoke an API key** in the portal. It stays in state with `status = "revoked"` (or `expired`, `deleted`), and plans fail until `rotation_trigger` changes.
 
-Air-gap operation is switched in the portal too: with `air_gapped` unset in the configuration, Terraform reads the Hub's value and never changes it. Only a configured value is applied — a configured `false` over the Hub's `true` revokes the licence files issued before, and the plan warns.
+Air-gap operation is switched on in the portal too — only by staff; the Hub refuses it from any API key (`403 air_gapped_staff_only`). With `air_gapped` unset in the configuration, Terraform reads the Hub's value and never changes it; `true` keeps it on; a configured `false` over the Hub's `true` switches it off and revokes the licence files issued before, and the plan warns.
 
 ## Endpoint security
 

@@ -185,8 +185,10 @@ func (r *licenseResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				Computed: true,
 				Description: "Air-gap operation for an installation without internet access: only then does the AI Hub issue licence files " +
 					"(offline, up to 12 months, without the daily online check and without `max_instances`). Only for `ai-gateway`. " +
-					"Unset, Terraform leaves it as the Hub has it (switched in the portal; a new licence starts with `false`) and only reads it. " +
-					"Set, Terraform manages it in place; switching it off revokes the licence files issued before (online tokens stay valid).",
+					"Only AI Hub staff switch it on, in the portal; an API key cannot (`403 air_gapped_staff_only`). " +
+					"Unset, Terraform leaves it as the Hub has it (a new licence starts with `false`) and only reads it. " +
+					"`true` keeps a value the portal switched on; `false` switches it off in place, which revokes the licence files issued before " +
+					"(online tokens stay valid).",
 				// Unset in the configuration, the Hub's value stays — also a
 				// switch an admin made in the portal: no diff, never sent.
 				PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
@@ -427,11 +429,18 @@ var licenseHints = map[string]string{
 	"invalid_domain":            "details.domains lists the rejected entries. Use host names such as gpt.example.com or *.example.com.",
 	"unbilled_max_exceeded":     "unbilled_max_until is beyond the limit in details.max_until_limit: trial at most 60 days, partner and internal at most 12 months from today.",
 	"unbilled_max_in_past":      "unbilled_max_until must be today or later.",
+	"air_gapped_staff_only":     airGapStaffOnlyHint,
 	"air_gapped_unsupported": "Air-gap operation exists only for ai-gateway licences (details.product is this licence's product). " +
 		"Remove air_gapped or set it to false.",
 	"license_ended": "The licence was ended in the AI Hub. Terraform does not re-issue it on its own: change rotation_trigger to issue a new licence, " +
 		"or remove the resource from the configuration.",
 }
+
+// airGapStaffOnlyHint explains the AI Hub's 403 air_gapped_staff_only: only
+// staff switch air-gap operation on, never an API key — and the provider
+// always calls with one.
+const airGapStaffOnlyHint = "Only an AI Hub staff member can switch air-gap operation on, in the portal (licence page). " +
+	"Switch it on there, then keep air_gapped = true or leave it unset; Terraform can keep it on or switch it off."
 
 func licensePath(id string) string {
 	return licensesPath + "/" + url.PathEscape(id)
@@ -773,8 +782,12 @@ func (r *licenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 // rotation_trigger change acts on them — a new licence for an ended one, an
 // in-place key rotation otherwise.
 func (r *licenseResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
-	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
-		return // create or destroy
+	if req.Plan.Raw.IsNull() {
+		return // destroy
+	}
+	if req.State.Raw.IsNull() {
+		refuseAirGappedCreate(ctx, req, resp)
+		return
 	}
 	var state, plan licenseModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -828,6 +841,22 @@ func airGapRemoved(state, plan licenseModel) bool {
 	return state.Status.ValueString() != licenseStatusEnded && state.AirGapped.ValueBool() &&
 		plan.AirGapped.Equal(types.BoolValue(false)) &&
 		plan.EnvironmentID.Equal(state.EnvironmentID) && plan.Product.Equal(state.Product)
+}
+
+// refuseAirGappedCreate stops a new licence with air_gapped = true at plan
+// time (also the new licence of a replacement): the AI Hub refuses it from
+// any API key (403 air_gapped_staff_only), and the provider always calls
+// with one. A licence that already has it is no create, so true stays
+// possible there. An unknown value is checked again at apply.
+func refuseAirGappedCreate(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	var airGapped types.Bool
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("air_gapped"), &airGapped)...)
+	if !airGapped.ValueBool() {
+		return
+	}
+	resp.Diagnostics.AddAttributeError(path.Root("air_gapped"), "Air-gap operation is switched on in the portal, not by Terraform",
+		"The AI Hub refuses air_gapped = true from an API key (403 air_gapped_staff_only), and Terraform always calls with one, "+
+			"so a new licence cannot start air-gapped. Issue it without air_gapped (or with false). "+airGapStaffOnlyHint)
 }
 
 // planKey plans the key attributes.

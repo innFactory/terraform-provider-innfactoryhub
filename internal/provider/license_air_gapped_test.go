@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -26,11 +27,12 @@ import (
 )
 
 // Air-gap operation (`params.air_gapped`): the AI Hub issues licence files
-// only for such licences; an admin switches it in the portal, and switching
-// it off revokes the files. The Hub treats it as an ordinary parameter
-// (default false, changeable by PATCH, true only for ai-gateway). The
-// provider sends it only when the configuration sets it: unset, the Hub's
-// value stays and is only read.
+// only for such licences. Only staff switch it on, in the portal; an API key
+// — and the provider always uses one — gets 403 air_gapped_staff_only for a
+// create with true or a PATCH false -> true. Keeping true and switching it
+// off (which revokes the files) stay possible. The provider sends it only
+// when the configuration sets it: unset, the Hub's value stays and is only
+// read.
 
 // air_gapped is optional and computed without a default: unset, the plan
 // keeps the value read from the Hub; set, it changes in place — never a new
@@ -368,11 +370,9 @@ func TestLicenseCreateAirGapped(t *testing.T) {
 		name     string
 		value    string // HCL; "" = unset
 		wantSent any    // nil = no air_gapped key in params
-		want     bool
 	}{
-		{name: "unset", want: false},
-		{name: "false", value: "false", wantSent: false, want: false},
-		{name: "true", value: "true", wantSent: true, want: true},
+		{name: "unset"},
+		{name: "false", value: "false", wantSent: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -387,15 +387,12 @@ func TestLicenseCreateAirGapped(t *testing.T) {
 					{
 						Config: cfg,
 						Check: resource.ComposeAggregateTestCheckFunc(
-							resource.TestCheckResourceAttr(licAddr, "air_gapped", fmt.Sprint(tc.want)),
-							func(s *terraform.State) error {
+							resource.TestCheckResourceAttr(licAddr, "air_gapped", "false"),
+							func(*terraform.State) error {
 								params, _ := hub.lastBody("POST /api/v1/admin/licenses")["params"].(map[string]any)
 								got, sent := params["air_gapped"]
 								if sent != (tc.wantSent != nil) || got != tc.wantSent {
 									return fmt.Errorf("POST params.air_gapped = %v (sent %v), want %v", got, sent, tc.wantSent)
-								}
-								if l, _ := hub.license(stateAttr(s, "id")); l.Params.AirGapped != tc.want {
-									return fmt.Errorf("Hub licence air_gapped = %v, want %v", l.Params.AirGapped, tc.want)
 								}
 								return nil
 							},
@@ -406,6 +403,66 @@ func TestLicenseCreateAirGapped(t *testing.T) {
 			})
 		})
 	}
+}
+
+// staffOnlyHint matches the provider's text for the Hub's staff-only rule:
+// at plan time for a new licence, from the Hub's 403 for an update.
+var staffOnlyHint = `Only\s+an\s+AI\s+Hub\s+staff\s+member\s+can\s+switch\s+air-gap\s+operation\s+on,\s+in\s+the\s+portal`
+
+// A new licence with air_gapped = true would be refused by the Hub (403
+// air_gapped_staff_only: only staff switch it on, never an API key), so the
+// plan fails before any request — also for the new licence of a
+// replacement, and before the Hub's product check (as in the Hub).
+func TestLicenseCreateAirGappedRefusedAtPlan(t *testing.T) {
+	wantErr := regexp.MustCompile(`(?s)Air-gap operation is switched on in the portal, not by Terraform.*air_gapped_staff_only.*` + staffOnlyHint)
+	cases := []struct {
+		name  string
+		attrs licenseAttrs
+	}{
+		{name: "AI Gateway", attrs: gatewayLicense().with(licenseAttrs{"air_gapped": "true"})},
+		{name: "AI Prices", attrs: pricesLicense().with(licenseAttrs{"air_gapped": "true"})},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hub := newLicenseHub(t)
+			useFakeHubEnv(t)
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testProviderFactories(),
+				Steps:                    []resource.TestStep{{Config: licenseConfig(hub, tc.attrs), PlanOnly: true, ExpectError: wantErr}},
+			})
+			if n := hub.callCount(); n != 0 {
+				t.Fatalf("refused create reached the Hub (%d request(s))", n)
+			}
+		})
+	}
+
+	t.Run("replacement", func(t *testing.T) {
+		hub := newLicenseHub(t)
+		useFakeHubEnv(t)
+		var id string
+		resource.UnitTest(t, resource.TestCase{
+			ProtoV6ProviderFactories: testProviderFactories(),
+			CheckDestroy:             checkLicensesEnded(hub),
+			Steps: []resource.TestStep{
+				{Config: licenseConfig(hub, gatewayLicense()), Check: captureAttr(licAddr, "id", &id)},
+				{
+					PreConfig: hub.resetCalls,
+					Config: licenseConfig(hub, gatewayLicense().with(licenseAttrs{
+						"environment_id": fmt.Sprintf("%q", alphaStagingEnvID), "air_gapped": "true",
+					})),
+					ExpectError: wantErr,
+				},
+				{
+					Config:           licenseConfig(hub, gatewayLicense()),
+					ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}},
+					Check: resource.ComposeAggregateTestCheckFunc(
+						resource.TestCheckResourceAttrPtr(licAddr, "id", &id),
+						noWrites(hub),
+					),
+				},
+			},
+		})
+	})
 }
 
 // noWrites asserts that the step sent nothing but reads to the Hub.
@@ -544,34 +601,109 @@ func TestLicenseImportAirGapped(t *testing.T) {
 	})
 }
 
-// air_gapped = true on a product other than ai-gateway is the Hub's to
-// refuse (422 air_gapped_unsupported); the provider shows the product and
-// what to do, and leaves state and Hub as they were.
-func TestLicenseUpdateAirGappedRejectedForOtherProducts(t *testing.T) {
-	hub := newLicenseHub(t)
-	useFakeHubEnv(t)
-	original := licenseConfig(hub, pricesLicense())
+// Switching air-gap operation on in place is refused by the Hub (403
+// air_gapped_staff_only, before its product check): the error carries the
+// hint, the Hub writes nothing — not even the other changes of the same
+// PATCH — and state stays as it was, so the previous configuration plans
+// nothing.
+func TestLicenseAirGappedSwitchOnRefused(t *testing.T) {
+	cases := []struct {
+		name     string
+		from, to licenseAttrs
+	}{
+		{name: "AI Gateway, with another change", from: gatewayLicense(),
+			to: gatewayLicense().with(licenseAttrs{"air_gapped": "true", "max_users": "80"})},
+		{name: "AI Gateway, explicit false before", from: gatewayLicense().with(licenseAttrs{"air_gapped": "false"}),
+			to: gatewayLicense().with(licenseAttrs{"air_gapped": "true"})},
+		{name: "AI Prices", from: pricesLicense(), to: pricesLicense().with(licenseAttrs{"air_gapped": "true"})},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hub := newLicenseHub(t)
+			useFakeHubEnv(t)
+			original := licenseConfig(hub, tc.from)
 
-	var id string
-	resource.UnitTest(t, resource.TestCase{
-		ProtoV6ProviderFactories: testProviderFactories(),
-		CheckDestroy:             checkLicensesEnded(hub),
-		Steps: []resource.TestStep{
-			{Config: original, Check: captureAttr(licAddr, "id", &id)},
-			{
-				Config:      licenseConfig(hub, pricesLicense().with(licenseAttrs{"air_gapped": "true"})),
-				ExpectError: regexp.MustCompile(`(?s)Update licence failed.*422 air_gapped_unsupported.*"product":"ai-prices".*only\s+for\s+ai-gateway`),
-			},
-			{
-				Config:           original,
-				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}},
-				Check: func(*terraform.State) error {
-					if l, _ := hub.license(id); l.Params.AirGapped || l.Revision != 1 {
-						return fmt.Errorf("Hub licence changed: air_gapped %v, revision %d", l.Params.AirGapped, l.Revision)
-					}
-					return nil
+			var id string
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testProviderFactories(),
+				CheckDestroy:             checkLicensesEnded(hub),
+				Steps: []resource.TestStep{
+					{Config: original, Check: captureAttr(licAddr, "id", &id)},
+					{
+						Config:      licenseConfig(hub, tc.to),
+						ExpectError: regexp.MustCompile(`(?s)Update licence failed.*403 air_gapped_staff_only.*` + staffOnlyHint),
+					},
+					{
+						Config:           original,
+						ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}},
+						Check: resource.ComposeAggregateTestCheckFunc(
+							resource.TestCheckResourceAttr(licAddr, "air_gapped", "false"),
+							resource.TestCheckResourceAttr(licAddr, "max_users", "50"),
+							func(*terraform.State) error {
+								if l, _ := hub.license(id); l.Params.AirGapped || l.Revision != 1 || *l.Params.MaxUsers != 50 {
+									return fmt.Errorf("Hub licence changed: air_gapped %v, revision %d, max_users %d",
+										l.Params.AirGapped, l.Revision, *l.Params.MaxUsers)
+								}
+								return nil
+							},
+						),
+					},
 				},
-			},
-		},
-	})
+			})
+		})
+	}
+}
+
+// The create check runs only for a new licence and only on a configured
+// true: a licence that already has it (state) keeps air_gapped = true.
+func TestLicenseCreatePlanRefusesAirGapped(t *testing.T) {
+	ctx := context.Background()
+	var schemaResp fwresource.SchemaResponse
+	newLicenseResource().Schema(ctx, fwresource.SchemaRequest{}, &schemaResp)
+	objType := schemaResp.Schema.Type().TerraformType(ctx).(tftypes.Object)
+	object := func(airGapped tftypes.Value) tftypes.Value {
+		vals := map[string]tftypes.Value{}
+		for name, typ := range objType.AttributeTypes {
+			vals[name] = tftypes.NewValue(typ, nil)
+		}
+		vals["air_gapped"] = airGapped
+		return tftypes.NewValue(objType, vals)
+	}
+	cases := []struct {
+		name    string
+		config  tftypes.Value
+		wantErr bool
+	}{
+		{name: "true", config: tftypes.NewValue(tftypes.Bool, true), wantErr: true},
+		{name: "false", config: tftypes.NewValue(tftypes.Bool, false)},
+		{name: "unset", config: tftypes.NewValue(tftypes.Bool, nil)},
+		{name: "unknown until apply", config: tftypes.NewValue(tftypes.Bool, tftypes.UnknownValue)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			planned := tfsdk.Plan{Schema: schemaResp.Schema, Raw: object(tc.config)}
+			resp := fwresource.ModifyPlanResponse{Plan: planned}
+			newLicenseResource().(fwresource.ResourceWithModifyPlan).ModifyPlan(ctx, fwresource.ModifyPlanRequest{
+				Config: tfsdk.Config{Schema: schemaResp.Schema, Raw: object(tc.config)},
+				State:  tfsdk.State{Schema: schemaResp.Schema, Raw: tftypes.NewValue(objType, nil)},
+				Plan:   planned,
+			}, &resp)
+			if resp.Diagnostics.HasError() != tc.wantErr {
+				t.Fatalf("error = %v, want %v: %v", resp.Diagnostics.HasError(), tc.wantErr, resp.Diagnostics)
+			}
+			for _, d := range resp.Diagnostics.Errors() {
+				wd, ok := d.(diag.DiagnosticWithPath)
+				if !ok || !wd.Path().Equal(path.Root("air_gapped")) || !strings.Contains(d.Detail(), "air_gapped_staff_only") {
+					t.Fatalf("error not about air_gapped_staff_only on air_gapped: %v", d)
+				}
+			}
+		})
+	}
+	// A licence in state that has true keeps it: no create, no error.
+	resp := modifyPlanValues(t, newLicenseResource(),
+		map[string]any{"id": "lic_1", "environment_id": "env_1", "product": "ai-gateway", "status": "active", "air_gapped": true},
+		map[string]any{"id": "lic_1", "environment_id": "env_1", "product": "ai-gateway", "status": "active", "air_gapped": true})
+	if resp.Diagnostics.HasError() || len(resp.Diagnostics.Warnings()) != 0 {
+		t.Fatalf("keeping true: %v", resp.Diagnostics)
+	}
 }

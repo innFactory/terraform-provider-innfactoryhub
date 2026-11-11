@@ -28,8 +28,13 @@ import (
 //   - POST with an Idempotency-Key seen before (24 h): 409 idempotent_replay
 //     with details.license_id, and never the key again
 //   - params.air_gapped defaults to false (also for licences stored before it
-//     existed) and changes in place; true only for ai-gateway, on create and
-//     PATCH (422 air_gapped_unsupported with details.product, nothing written)
+//     existed). Every caller here is an API key, and keys never switch it on:
+//     create with true or PATCH false -> true is 403 air_gapped_staff_only,
+//     nothing written, checked before anything else on create and before the
+//     product check on PATCH; an unchanged true and switching it off are
+//     fine. Staff switch it on in the portal (setAirGappedOutOfBand,
+//     seedLicense). true only for ai-gateway (422 air_gapped_unsupported with
+//     details.product)
 
 // Seeded fixtures for licence tests.
 const (
@@ -460,6 +465,17 @@ func fakeUnbilledLink(in fakeUnbilledInput) (*fakeUnbilled, *fakeHTTPError) {
 	return &fakeUnbilled{Reason: in.Reason, MaxUntil: *in.MaxUntil}, nil
 }
 
+// fakeAirGapStaffOnly mirrors assertMayEnableAirGap for an API-key caller:
+// switching air-gap operation on (before false, after true) is for staff in
+// the portal only.
+func fakeAirGapStaffOnly(before, after bool) *fakeHTTPError {
+	if after && !before {
+		return &fakeHTTPError{status: http.StatusForbidden, code: "air_gapped_staff_only",
+			message: "Air-Gap-Betrieb schalten nur Mitarbeiter im Portal ein, nie ein API-Key"}
+	}
+	return nil
+}
+
 // fakeAirGapSupported mirrors assertAirGapSupported: air-gap operation (a
 // licence file instead of the online check) exists only for the AI Gateway.
 func fakeAirGapSupported(product string, airGapped bool) *fakeHTTPError {
@@ -540,6 +556,11 @@ func (h *fakeHub) createLicense(w http.ResponseWriter, r *http.Request) {
 		badRequest("params.max_users and params.edition_id are required").write(w)
 		return
 	}
+	airGapped := p.AirGapped != nil && *p.AirGapped
+	if herr := fakeAirGapStaffOnly(false, airGapped); herr != nil {
+		herr.write(w)
+		return
+	}
 	if ok, herr := fakeBillingInput(body); herr != nil {
 		herr.write(w)
 		return
@@ -547,7 +568,6 @@ func (h *fakeHub) createLicense(w http.ResponseWriter, r *http.Request) {
 		billingLinkRequired().write(w)
 		return
 	}
-	airGapped := p.AirGapped != nil && *p.AirGapped
 	if herr := fakeAirGapSupported(body.Product, airGapped); herr != nil {
 		herr.write(w)
 		return
@@ -755,6 +775,10 @@ func (h *fakeHub) patchLicense(w http.ResponseWriter, r *http.Request) {
 			herr.write(w)
 			return
 		}
+	}
+	if herr := fakeAirGapStaffOnly(cur.Params.AirGapped, next.Params.AirGapped); herr != nil {
+		herr.write(w)
+		return
 	}
 	if herr := fakeAirGapSupported(next.Product, next.Params.AirGapped); herr != nil {
 		herr.write(w)
