@@ -27,6 +27,9 @@ import (
 //     for suspended or expired licences, never for ended ones (409 license_ended)
 //   - POST with an Idempotency-Key seen before (24 h): 409 idempotent_replay
 //     with details.license_id, and never the key again
+//   - params.air_gapped defaults to false (also for licences stored before it
+//     existed) and changes in place; true only for ai-gateway, on create and
+//     PATCH (422 air_gapped_unsupported with details.product, nothing written)
 
 // Seeded fixtures for licence tests.
 const (
@@ -48,6 +51,7 @@ type fakeLicenseParams struct {
 	EditionID    string   `json:"edition_id"`
 	Features     []string `json:"features"`
 	Entitlements []string `json:"entitlements"`
+	AirGapped    bool     `json:"air_gapped"`
 }
 
 type fakeUnbilled struct {
@@ -239,6 +243,16 @@ func (h *fakeHub) rotateKeyOutOfBand(id string) {
 	h.rotateKeyLocked(id)
 }
 
+// setAirGappedOutOfBand switches air-gap operation as an admin in the
+// portal would (e.g. to download a licence file).
+func (h *fakeHub) setAirGappedOutOfBand(id string, on bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	l := h.licenses[id]
+	l.Params.AirGapped = on
+	l.Revision++
+}
+
 // activeKeyIDs lists the unrevoked key ids of a licence.
 func (h *fakeHub) activeKeyIDs(licenseID string) []string {
 	h.mu.Lock()
@@ -262,6 +276,7 @@ type fakeParamsInput struct {
 	EditionID    *string         `json:"edition_id"`
 	Features     []string        `json:"features"`
 	Entitlements []string        `json:"entitlements"`
+	AirGapped    *bool           `json:"air_gapped"`
 }
 
 type fakeUnbilledInput struct {
@@ -445,6 +460,16 @@ func fakeUnbilledLink(in fakeUnbilledInput) (*fakeUnbilled, *fakeHTTPError) {
 	return &fakeUnbilled{Reason: in.Reason, MaxUntil: *in.MaxUntil}, nil
 }
 
+// fakeAirGapSupported mirrors assertAirGapSupported: air-gap operation (a
+// licence file instead of the online check) exists only for the AI Gateway.
+func fakeAirGapSupported(product string, airGapped bool) *fakeHTTPError {
+	if airGapped && product != "ai-gateway" {
+		return &fakeHTTPError{status: http.StatusUnprocessableEntity, code: "air_gapped_unsupported",
+			message: "Air-Gap-Betrieb gibt es nur für AI-Gateway-Lizenzen", details: map[string]any{"product": product}}
+	}
+	return nil
+}
+
 func billingLinkRequired() *fakeHTTPError {
 	return &fakeHTTPError{status: http.StatusBadRequest, code: "billing_link_required",
 		message: "Genau eins angeben: contract_position_id (abgerechnet) oder unbilled {reason: trial|partner|internal, max_until?}"}
@@ -522,6 +547,11 @@ func (h *fakeHub) createLicense(w http.ResponseWriter, r *http.Request) {
 		billingLinkRequired().write(w)
 		return
 	}
+	airGapped := p.AirGapped != nil && *p.AirGapped
+	if herr := fakeAirGapSupported(body.Product, airGapped); herr != nil {
+		herr.write(w)
+		return
+	}
 	domains, herr := fakeLicenseDomains(p.Domains)
 	if herr != nil {
 		herr.write(w)
@@ -597,7 +627,7 @@ func (h *fakeHub) createLicense(w http.ResponseWriter, r *http.Request) {
 		entitlements = []string{}
 	}
 	l.Params = fakeLicenseParams{Domains: domains, MaxUsers: maxUsers, MaxInstances: maxInstances,
-		EditionID: *p.EditionID, Features: features, Entitlements: entitlements}
+		EditionID: *p.EditionID, Features: features, Entitlements: entitlements, AirGapped: airGapped}
 	h.licenses[l.LicenseID] = l
 	if idemKey != "" {
 		h.idempotency[idemKey] = "license:" + l.LicenseID
@@ -726,6 +756,10 @@ func (h *fakeHub) patchLicense(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if herr := fakeAirGapSupported(next.Product, next.Params.AirGapped); herr != nil {
+		herr.write(w)
+		return
+	}
 	if reflect.DeepEqual(next, *cur) {
 		writeData(w, http.StatusOK, map[string]any{"license": *cur})
 		return
@@ -775,6 +809,9 @@ func fakeMergeParams(l *fakeLicense, p *fakeParamsInput) *fakeHTTPError {
 			e = []string{}
 		}
 		l.Params.Entitlements = e
+	}
+	if p.AirGapped != nil {
+		l.Params.AirGapped = *p.AirGapped
 	}
 	editionChanged := p.EditionID != nil && *p.EditionID != l.Params.EditionID
 	if !editionChanged && p.Features == nil {

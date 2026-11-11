@@ -43,6 +43,12 @@ func gatewayLicense() licenseAttrs {
 	}
 }
 
+// pricesLicense is an AI Prices licence for Alpha, billed through Alpha's
+// AI Prices position — a product without air-gap operation.
+func pricesLicense() licenseAttrs {
+	return gatewayLicense().with(licenseAttrs{"product": `"ai-prices"`, "contract_position_id": fmt.Sprintf("%q", alphaPricesPosID)})
+}
+
 // with returns a copy with the overrides applied ("" removes an attribute).
 func (a licenseAttrs) with(overrides licenseAttrs) licenseAttrs {
 	out := maps.Clone(a)
@@ -94,7 +100,8 @@ func stateAttr(s *terraform.State, attr string) string {
 
 // The rollout path: a licence bound to a contract position. The Hub issues
 // the key exactly once; it lands in state, and the Hub's defaults (all
-// features of the edition, 5 instances, no entitlements) are filled in.
+// features of the edition, 5 instances, no entitlements, not air-gapped) are
+// filled in. air_gapped is not configured, so it is not sent.
 func TestLicenseCreateLinkedToContractPosition(t *testing.T) {
 	hub := newLicenseHub(t)
 	useFakeHubEnv(t)
@@ -118,6 +125,7 @@ func TestLicenseCreateLinkedToContractPosition(t *testing.T) {
 				resource.TestCheckResourceAttr(licAddr, "features.#", fmt.Sprint(len(allGatewayFeatures))),
 				resource.TestCheckTypeSetElemAttr(licAddr, "features.*", "guardrails"),
 				resource.TestCheckResourceAttr(licAddr, "entitlements.#", "0"),
+				resource.TestCheckResourceAttr(licAddr, "air_gapped", "false"),
 				resource.TestCheckResourceAttr(licAddr, "contract_position_id", alphaPositionID),
 				resource.TestCheckNoResourceAttr(licAddr, "unbilled_reason"),
 				resource.TestCheckResourceAttr(licAddr, "status", "active"),
@@ -387,7 +395,9 @@ func TestLicenseNoChangesMeansNoWrites(t *testing.T) {
 			"max_instances": "3",
 			"features":      `["mcp", "flows"]`,
 			"entitlements":  `["ai-prices"]`,
+			"air_gapped":    "true",
 		})},
+		{name: "air_gapped = false written out", attrs: gatewayLicense().with(licenseAttrs{"air_gapped": "false"})},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -548,6 +558,20 @@ func TestLicenseUpdateInPlace(t *testing.T) {
 			to:    gatewayLicense().with(licenseAttrs{"entitlements": `["ai-prices"]`}),
 			patch: map[string]any{"params": map[string]any{"entitlements": []string{"ai-prices"}}},
 			check: resource.TestCheckTypeSetElemAttr(licAddr, "entitlements.*", "ai-prices"),
+		},
+		{
+			name: "air_gapped switched on", from: gatewayLicense(),
+			to:    gatewayLicense().with(licenseAttrs{"air_gapped": "true"}),
+			patch: map[string]any{"params": map[string]any{"air_gapped": true}},
+			check: resource.TestCheckResourceAttr(licAddr, "air_gapped", "true"),
+		},
+		{
+			// Only an explicit false switches it off; removing the attribute
+			// would leave the Hub's value (TestLicenseAirGappedSwitchedInPortal).
+			name: "air_gapped switched off", from: gatewayLicense().with(licenseAttrs{"air_gapped": "true"}),
+			to:    gatewayLicense().with(licenseAttrs{"air_gapped": "false"}),
+			patch: map[string]any{"params": map[string]any{"air_gapped": false}},
+			check: resource.TestCheckResourceAttr(licAddr, "air_gapped", "false"),
 		},
 		{
 			name:  "edition with configured features",
@@ -785,7 +809,7 @@ func TestLicenseImportPortalCreatedThenRotate(t *testing.T) {
 						"max_users": "50", "unlimited": "false", "max_instances": "5", "edition": "all",
 						"unbilled_reason": "trial", "unbilled_max_until": trialEnd, "valid_until": trialEnd,
 						"features.#": fmt.Sprint(len(allGatewayFeatures)), "domains.#": "1", "license_key": "",
-						"key_id": "", "key_status": "", "status": "active",
+						"key_id": "", "key_status": "", "status": "active", "air_gapped": "false",
 					}
 					for k, v := range want {
 						if a[k] != v {
@@ -943,6 +967,8 @@ func TestLicenseCreateRejectedByHub(t *testing.T) {
 			wantErr: `(?s)400 unbilled_max_exceeded.*max_until_limit.*60\s+days`},
 		{name: "trial end in the past", attrs: trial.with(licenseAttrs{"unbilled_max_until": fmt.Sprintf("%q", yesterday)}),
 			wantErr: `(?s)400 unbilled_max_in_past.*today\s+or\s+later`},
+		{name: "air-gapped AI Prices licence", attrs: pricesLicense().with(licenseAttrs{"air_gapped": "true"}),
+			wantErr: `(?s)422 air_gapped_unsupported.*"product":"ai-prices".*only\s+for\s+ai-gateway`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

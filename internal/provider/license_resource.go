@@ -22,6 +22,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setdefault"
@@ -66,6 +67,7 @@ type licenseModel struct {
 	Edition            types.String `tfsdk:"edition"`
 	Features           types.Set    `tfsdk:"features"`
 	Entitlements       types.Set    `tfsdk:"entitlements"`
+	AirGapped          types.Bool   `tfsdk:"air_gapped"`
 	ContractPositionID types.String `tfsdk:"contract_position_id"`
 	UnbilledReason     types.String `tfsdk:"unbilled_reason"`
 	UnbilledMaxUntil   types.String `tfsdk:"unbilled_max_until"`
@@ -177,6 +179,17 @@ func (r *licenseResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				Default:     setdefault.StaticValue(types.SetValueMust(types.StringType, []attr.Value{})),
 				Description: "Additional entitlements such as `ai-prices`. Defaults to none.",
 				Validators:  []validator.Set{setvalidator.SizeAtMost(50), setvalidator.ValueStringsAre(nameToken)},
+			},
+			"air_gapped": schema.BoolAttribute{
+				Optional: true,
+				Computed: true,
+				Description: "Air-gap operation for an installation without internet access: only then does the AI Hub issue licence files " +
+					"(offline, up to 12 months, without the daily online check and without `max_instances`). Only for `ai-gateway`. " +
+					"Unset, Terraform leaves it as the Hub has it (switched in the portal; a new licence starts with `false`) and only reads it. " +
+					"Set, Terraform manages it in place; switching it off revokes the licence files issued before (online tokens stay valid).",
+				// Unset in the configuration, the Hub's value stays — also a
+				// switch an admin made in the portal: no diff, never sent.
+				PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
 			},
 			"contract_position_id": schema.StringAttribute{
 				Optional:    true,
@@ -319,6 +332,9 @@ type licenseParamsDTO struct {
 	EditionID    string   `json:"edition_id"`
 	Features     []string `json:"features"`
 	Entitlements []string `json:"entitlements"`
+	// AirGapped is false for licences the Hub stored before the parameter
+	// existed; a response without it decodes to the same.
+	AirGapped bool `json:"air_gapped"`
 }
 
 // licenseUnbilled is `unbilled` in requests and responses; requests omit
@@ -364,7 +380,8 @@ type licenseCreateResponse struct {
 }
 
 // licenseCreateParams always sends max_users (null = unlimited) and
-// entitlements; features only when configured (else: all of the edition).
+// entitlements; features and air_gapped only when configured (else: all of
+// the edition, and the Hub's false).
 type licenseCreateParams struct {
 	Domains      []string  `json:"domains"`
 	MaxUsers     *int64    `json:"max_users"`
@@ -372,6 +389,7 @@ type licenseCreateParams struct {
 	EditionID    string    `json:"edition_id"`
 	Features     *[]string `json:"features,omitempty"`
 	Entitlements []string  `json:"entitlements"`
+	AirGapped    *bool     `json:"air_gapped,omitempty"`
 }
 
 type licenseCreateBody struct {
@@ -409,6 +427,8 @@ var licenseHints = map[string]string{
 	"invalid_domain":            "details.domains lists the rejected entries. Use host names such as gpt.example.com or *.example.com.",
 	"unbilled_max_exceeded":     "unbilled_max_until is beyond the limit in details.max_until_limit: trial at most 60 days, partner and internal at most 12 months from today.",
 	"unbilled_max_in_past":      "unbilled_max_until must be today or later.",
+	"air_gapped_unsupported": "Air-gap operation exists only for ai-gateway licences (details.product is this licence's product). " +
+		"Remove air_gapped or set it to false.",
 	"license_ended": "The licence was ended in the AI Hub. Terraform does not re-issue it on its own: change rotation_trigger to issue a new licence, " +
 		"or remove the resource from the configuration.",
 }
@@ -443,6 +463,10 @@ func (m *licenseModel) createBody(ctx context.Context, diags *diag.Diagnostics) 
 	}
 	if features := stringsOf(ctx, diags, m.Features); features != nil {
 		body.Params.Features = &features
+	}
+	// Unset in the configuration, air_gapped is unknown in the create plan.
+	if !m.AirGapped.IsNull() && !m.AirGapped.IsUnknown() {
+		body.Params.AirGapped = m.AirGapped.ValueBoolPointer()
 	}
 	body.ContractPositionID, body.Unbilled = m.billingLink()
 	return body
@@ -519,6 +543,9 @@ func (m *licenseModel) fillComputed(ctx context.Context, diags *diag.Diagnostics
 	if m.Features.IsUnknown() {
 		m.Features = strSet(ctx, diags, l.Params.Features)
 	}
+	if m.AirGapped.IsUnknown() {
+		m.AirGapped = types.BoolValue(l.Params.AirGapped)
+	}
 	if m.UnbilledMaxUntil.IsUnknown() {
 		m.UnbilledMaxUntil = types.StringNull()
 		if l.Unbilled != nil {
@@ -541,6 +568,8 @@ func (m *licenseModel) applyRemote(ctx context.Context, diags *diag.Diagnostics,
 	m.Edition = types.StringValue(l.Params.EditionID)
 	m.Features = strSet(ctx, diags, l.Params.Features)
 	m.Entitlements = strSet(ctx, diags, l.Params.Entitlements)
+	// Also fills state written before air_gapped existed (null).
+	m.AirGapped = types.BoolValue(l.Params.AirGapped)
 	m.ContractPositionID = types.StringPointerValue(l.ContractPositionID)
 	m.UnbilledReason, m.UnbilledMaxUntil = types.StringNull(), types.StringNull()
 	if l.Unbilled != nil {
@@ -778,6 +807,27 @@ func (r *licenseResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		// No rotation: the key stays as it is, including "no key" after import.
 		planKey(ctx, resp, state.LicenseKey, state.KeyID, state.KeyStatus)
 	}
+
+	// Switching air-gap operation off is a reduction in the Hub: it revokes
+	// the licence files issued before. Only a configured false does it (an
+	// unset air_gapped keeps the Hub's value); the plan says so — the Hub's
+	// true may be a switch an admin made in the portal.
+	if airGapRemoved(state, plan) {
+		resp.Diagnostics.AddAttributeWarning(path.Root("air_gapped"), "Switching off air-gap operation revokes licence files",
+			fmt.Sprintf("air_gapped changes from true to false for licence %s. The AI Hub then revokes every licence file issued for it "+
+				"before and issues no new ones; online activation and its tokens are not affected. Installations that run on a licence file "+
+				"need online activation with the licence key instead. If air-gap operation was switched on in the portal on purpose, "+
+				"set air_gapped = true, or remove air_gapped from the configuration to leave it to the portal.", state.ID.ValueString()))
+	}
+}
+
+// airGapRemoved reports an in-place update of a licence that is not ended
+// (same environment and product) switching air_gapped from true to false.
+// A value still unknown at plan time is not false.
+func airGapRemoved(state, plan licenseModel) bool {
+	return state.Status.ValueString() != licenseStatusEnded && state.AirGapped.ValueBool() &&
+		plan.AirGapped.Equal(types.BoolValue(false)) &&
+		plan.EnvironmentID.Equal(state.EnvironmentID) && plan.Product.Equal(state.Product)
 }
 
 // planKey plans the key attributes.
@@ -881,6 +931,12 @@ func paramsPatch(ctx context.Context, diags *diag.Diagnostics, plan, state licen
 	}
 	if !plan.Entitlements.Equal(state.Entitlements) {
 		params["entitlements"] = stringsOf(ctx, diags, plan.Entitlements)
+	}
+	// Only a configured value differs from state: unset, the plan keeps the
+	// state's value (UseStateForUnknown), so the Hub's value is never sent
+	// back — not even a switch made in the portal.
+	if !plan.AirGapped.IsUnknown() && !plan.AirGapped.IsNull() && !plan.AirGapped.Equal(state.AirGapped) {
+		params["air_gapped"] = plan.AirGapped.ValueBool()
 	}
 	return params
 }

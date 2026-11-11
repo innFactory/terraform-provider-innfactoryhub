@@ -16,17 +16,40 @@ import (
 // both are given as string attributes, everything else is null.
 func modifyPlan(t *testing.T, r fwresource.Resource, state, plan map[string]string) fwresource.ModifyPlanResponse {
 	t.Helper()
+	anyOf := func(attrs map[string]string) map[string]any {
+		out := make(map[string]any, len(attrs))
+		for k, v := range attrs {
+			out[k] = v
+		}
+		return out
+	}
+	return modifyPlanValues(t, r, anyOf(state), anyOf(plan))
+}
+
+// modifyPlanValues is modifyPlan for string, bool and raw (e.g. unknown)
+// attribute values.
+func modifyPlanValues(t *testing.T, r fwresource.Resource, state, plan map[string]any) fwresource.ModifyPlanResponse {
+	t.Helper()
 	ctx := context.Background()
 	var schemaResp fwresource.SchemaResponse
 	r.Schema(ctx, fwresource.SchemaRequest{}, &schemaResp)
 	objType := schemaResp.Schema.Type().TerraformType(ctx).(tftypes.Object)
-	raw := func(attrs map[string]string) tftypes.Value {
+	raw := func(attrs map[string]any) tftypes.Value {
 		vals := map[string]tftypes.Value{}
 		for name, typ := range objType.AttributeTypes {
 			vals[name] = tftypes.NewValue(typ, nil)
 		}
 		for name, v := range attrs {
-			vals[name] = tftypes.NewValue(tftypes.String, v)
+			switch v := v.(type) {
+			case string:
+				vals[name] = tftypes.NewValue(tftypes.String, v)
+			case bool:
+				vals[name] = tftypes.NewValue(tftypes.Bool, v)
+			case tftypes.Value:
+				vals[name] = v
+			default:
+				t.Fatalf("attribute %s: unsupported value %T", name, v)
+			}
 		}
 		return tftypes.NewValue(objType, vals)
 	}

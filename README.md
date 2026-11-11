@@ -42,6 +42,7 @@ Export `INNFACTORYHUB_ADMIN_KEY` with a system-scope admin key (mint one in *Hub
 | Plan (pull requests) | `INNFACTORYHUB_ADMIN_KEY` = system key `["read_licensing"]` (read-only; writes fail with `403 forbidden_read_only_key`) |
 | companyADMIN | `innfactoryhub_api_key`: `scope = "organization"`, `permissions = ["read_maintenance"]`, `expires_at` (required, ≤ 24 months), `rotation_trigger` — see [docs/resources/api_key.md](docs/resources/api_key.md) |
 | Gateway licence | `innfactoryhub_license.license_key`; rotate with `rotation_trigger` (same licence, new key) |
+| Gateway without internet | Air-gap operation in the portal (licence files only then); `innfactoryhub_license.air_gapped` unset leaves it there, set manages it from Terraform |
 | Audit | `INNFACTORYHUB_AUDIT_CONTEXT` = CI run URL, commit, customer |
 | Take something away | End or suspend the licence, revoke the key — **in the Hub**. Terraform does not undo it; plans fail until `rotation_trigger` changes. |
 
@@ -86,6 +87,8 @@ output "license_key" {
 ```
 
 The licence key (`lk_…`) is returned by the Hub only when the licence is issued or its key rotated; it stays in state and survives every in-place update (`max_users`, domains, edition, billing link …). Changing `rotation_trigger` rotates the key of the same licence in place (`key_id` changes, the old key is revoked at once); changing `environment_id` or `product` issues a new licence; destroy ends the licence. A licence ended in the Hub, or a key rotated there, is flagged and never silently re-issued. After `terraform import` the key is empty — rotate to get one. See [docs/resources/license.md](docs/resources/license.md).
+
+A gateway without internet access runs on a licence file, which the Hub issues only in air-gap operation (`air_gapped`, AI Gateway only); an admin or the customer downloads it in the portal — the provider never fetches it. Unset in the configuration, `air_gapped` stays as the Hub has it (switched in the portal; a new licence starts with `false`) and is only read. Set it to manage it from Terraform (in place); a configured `false` over the Hub's `true` revokes the licence files issued before, and the plan warns about it.
 
 ### Resolving a tenant — five ways
 

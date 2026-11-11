@@ -42,6 +42,11 @@ resource "innfactoryhub_license" "ai_gateway" {
   contract_position_id = var.contract_position_id
   unbilled_reason      = var.contract_position_id == null ? "trial" : null
 
+  # Air-gap operation (licence files instead of the daily online check) is
+  # switched in the portal; leave this unset to keep it there, or set it to
+  # manage it from Terraform.
+  # air_gapped = true
+
   # Change this value to rotate the licence key (same licence, new key; the
   # previous key stops working at once).
   rotation_trigger = "2026-11"

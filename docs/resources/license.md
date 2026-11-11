@@ -9,11 +9,12 @@ description: |-
 
 Issues a **licence** for an environment (`innfactoryhub_environment`) in the [innFactory AI Hub](https://hub.innfactory.ai) — for example the AI Gateway licence of a CompanyGPT installation — and returns its **licence key** (`lk_<id>.<secret>`) as a sensitive value, ready to be handed to the gateway (`LICENSE_KEY`).
 
-The Hub returns a licence key **only** when it issues the licence or rotates its key. The provider keeps it in state and carries it over unchanged through every in-place update; reads never touch it, but they check that it is still the licence's key (`key_id`, `key_status`). Licence files or signed licence tokens are never requested and never stored in state.
+The Hub returns a licence key **only** when it issues the licence or rotates its key. The provider keeps it in state and carries it over unchanged through every in-place update; reads never touch it, but they check that it is still the licence's key (`key_id`, `key_status`). Licence files or signed licence tokens are never requested and never stored in state. The Hub issues licence files only for air-gapped licences (`air_gapped = true`, see [Air-gapped installations](#air-gapped-installations)).
 
 | Change | Effect |
 |---|---|
 | `domains`, `max_users`/`unlimited`, `max_instances`, `edition`, `features`, `entitlements` | Updated in place (`PATCH`, only the changed fields); `id` and `license_key` stay |
+| `air_gapped` (set) | Updated in place (`PATCH`); switching it off revokes the licence files issued before (the plan warns), online tokens stay valid. Unset, it is never sent: the Hub's value (e.g. switched in the portal) stays |
 | `contract_position_id`, `unbilled_reason`, `unbilled_max_until` | Updated in place (`PATCH`); switching between a contract position and an unbilled reason is in place too |
 | `environment_id`, `product` | Forces a new licence (the current one is ended, a new one with a new key is issued) |
 | `rotation_trigger` (any change, including setting or removing it) | Rotates the key **in place**: same licence, instances and contract position; the old key is revoked at once, the new one lands in `license_key` |
@@ -84,6 +85,11 @@ resource "innfactoryhub_license" "ai_gateway" {
   contract_position_id = var.contract_position_id
   unbilled_reason      = var.contract_position_id == null ? "trial" : null
 
+  # Air-gap operation (licence files instead of the daily online check) is
+  # switched in the portal; leave this unset to keep it there, or set it to
+  # manage it from Terraform.
+  # air_gapped = true
+
   # Change this value to rotate the licence key (same licence, new key;
   # the previous key stops working at once).
   rotation_trigger = "2026-11"
@@ -112,6 +118,7 @@ output "license_key" {
 - `max_instances` (Number) Installations that may use the key at the same time, 1–100. Defaults to `5`.
 - `features` (Set of String) Subset of the edition's features. Without it the licence gets all features of the edition (also after an edition change). Removing a configured value keeps the current features; list them all to grant all again.
 - `entitlements` (Set of String) Additional entitlements, e.g. `ai-prices`. Defaults to none.
+- `air_gapped` (Boolean) Air-gap operation for an installation without internet access — only then does the Hub issue licence files. `ai-gateway` only. **Unset**, Terraform leaves it as the Hub has it (managed in the portal; a new licence starts with `false`) and only reads it. **Set**, Terraform manages it, updated in place. Also computed. See [Air-gapped installations](#air-gapped-installations).
 - `contract_position_id` (String) Contract position that bills the licence. Set **exactly one** of `contract_position_id` and `unbilled_reason` (checked at plan time).
 - `unbilled_reason` (String) Why the licence is not billed: `trial`, `partner` or `internal`.
 - `unbilled_max_until` (String) Last day (`YYYY-MM-DD`) of an unbilled licence; only together with `unbilled_reason`. Without it the Hub applies its default per reason — trial 30 days, partner and internal 12 months from the day of issue (limits: trial 60 days, partner and internal 12 months). The applied date is recorded here; re-applying the same reason does not extend it. A later date extends the licence. Also computed.
@@ -137,6 +144,16 @@ A rotation together with parameter changes sends the `PATCH` first, then rotates
 
 Do not combine a contract position with `lifecycle { create_before_destroy = true }`: when the licence is replaced (new `environment_id` or `product`), a contract position belongs to one licence at a time, so the new licence can only be issued after the old one has released it (`409 position_already_linked` otherwise).
 
+## Air-gapped installations
+
+A gateway without internet access cannot activate online. For such an installation set `air_gapped = true` (AI Gateway only): the AI Hub then lets an admin in the portal — or the customer in self-service — download a **licence file**, an offline licence token valid for up to 12 months (at most until the licence ends), without the daily online check and without the `max_instances` limit. For a licence without `air_gapped` the Hub refuses licence files (`409 license_file_not_allowed`). The provider never fetches licence files and never stores them in state; online activation with `license_key` keeps working for air-gapped licences too.
+
+- **Unset = managed in the portal.** Without `air_gapped` in the configuration the provider never sends it: a new licence gets the Hub's `false`, and a switch an admin makes in the portal (e.g. to hand out a licence file) stays — every refresh reads it into state, and the plan shows no diff. Removing the attribute from the configuration also leaves the Hub's value as it is.
+- **Set = managed in Terraform.** With `air_gapped = true` or `false` the provider sends it on create, and a configured value that differs from the Hub's updates the licence in place (`PATCH`).
+- Switching it **off** (a configured `false` over the Hub's `true`) is a reduction in the Hub: every licence file issued before is revoked through the revocation list and no new one is issued; online tokens stay valid. The plan warns `Switching off air-gap operation revokes licence files`.
+- Licences issued before the Hub knew the parameter read as `false`; state written by an earlier provider build takes the Hub's value on the next refresh, without a diff.
+- For `ai-prices` and `companygpt-maintenance` the Hub refuses `air_gapped = true` with `422 air_gapped_unsupported`.
+
 ## Errors
 
 Hub rejections are shown with their code, the Hub's `details` and a hint. Nothing is written to state when the Hub rejects a create.
@@ -154,6 +171,7 @@ Hub rejections are shown with their code, the Hub's `details` and a hint. Nothin
 | `422 invalid_domain` | Domains the Hub rejects (`details.domains`) | Use host names or `*.` host names |
 | `400 unbilled_max_exceeded` | End beyond the limit (`details.max_until_limit`) | Choose an earlier `unbilled_max_until` |
 | `400 unbilled_max_in_past` | End in the past | Choose today or later |
+| `422 air_gapped_unsupported` | `air_gapped = true` on a product other than `ai-gateway` (`details.product`) | Remove `air_gapped` or set it to `false` |
 | `409 license_ended` | The licence was ended in the Hub | Change `rotation_trigger` to issue a new licence, or remove the resource |
 | `409 idempotent_replay` | The Hub already issued the licence for this create (answer was lost) | Handled by the provider after its retry: it checks and adopts the licence and rotates its key |
 | `Licence already running for this environment and product` | A running licence of this product exists for the environment | `terraform import` it (then change `rotation_trigger`), or end it in the portal |
