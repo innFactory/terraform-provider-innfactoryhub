@@ -28,6 +28,20 @@ const hostNameExpr = `([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{
 // case drift.
 var hostNamePattern = regexp.MustCompile(`^` + hostNameExpr + `$`)
 
+// companygptHandlePattern is the Hub's format of a CompanyGPT handle — the
+// deployment name such as `innfactory` or `lmu`: lower-case letters, digits
+// and inner hyphens, 1–40 characters. The Hub stores handles trimmed and in
+// lower case; requiring that form here keeps config, state and Hub equal.
+var companygptHandlePattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$`)
+
+// companygptHandleFormat describes companygptHandlePattern in validator
+// messages and attribute descriptions.
+const companygptHandleFormat = "1–40 lower-case letters, digits and hyphens, starting and ending with a letter or digit"
+
+// companygptHandle validates a CompanyGPT handle at plan time.
+var companygptHandle = stringvalidator.RegexMatches(companygptHandlePattern,
+	"must be a CompanyGPT handle such as innfactory: "+companygptHandleFormat)
+
 // knownString reports a value that is known and non-empty — i.e. one the
 // user configured (validators already reject blank strings). Null, unknown
 // and "" all count as "not set".

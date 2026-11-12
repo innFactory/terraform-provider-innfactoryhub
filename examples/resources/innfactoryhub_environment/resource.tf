@@ -1,15 +1,26 @@
 # Register a customer's AI Gateway installation in the innFactory AI Hub.
-# The Hub resolves the customer from the Azure (Entra ID) tenant the
-# CompanyGPT stack is deployed into, so nobody has to type a tenant_id.
+# The Hub resolves the customer from the CompanyGPT handle — the deployment
+# name of the stack — so nobody has to type a tenant_id.
 
 provider "innfactoryhub" {
   endpoint = "https://hub.innfactory.ai"
   # admin_key is best supplied via INNFACTORYHUB_ADMIN_KEY.
 }
 
+# Recommended for CompanyGPT: bind by the CompanyGPT handle. Unique per
+# customer in the Hub and independent of the cloud the stack runs in.
+resource "innfactoryhub_environment" "ai_gateway" {
+  companygpt_handle = "innfactory"
+  name              = "AI Gateway ${terraform.workspace}"
+  domain            = "gpt.innfactory.example"
+  cloud             = "azure"
+}
+
+# Alternative: let the Hub resolve the customer from the Azure (Entra ID)
+# tenant the stack is deployed into.
 data "azurerm_client_config" "current" {}
 
-resource "innfactoryhub_environment" "ai_gateway" {
+resource "innfactoryhub_environment" "by_azure_tenant" {
   azure_tenant_id = data.azurerm_client_config.current.tenant_id
   name            = "AI Gateway ${terraform.workspace}"
   domain          = "gpt.acme.example"

@@ -9,13 +9,15 @@ description: |-
 
 Registers an **environment** — one CompanyGPT / AI Gateway installation of a customer — in the [innFactory AI Hub](https://hub.innfactory.ai). Licences ([`innfactoryhub_license`](license.md)) hang off the environment's `id`; the Hub deletes an environment only after its licences have ended, and Terraform destroys the licences first when both are in one configuration.
 
-The customer is named by **exactly one** of `tenant_id`, `azure_tenant_id`, `azure_tenant_domain`, `azure_subscription_id`, `gcp_project_id` or `aws_account_id`. For a cloud identifier the Hub resolves the customer at create time (same rules as `data "innfactoryhub_tenant"`) and returns it as `tenant_id`.
+The customer is named by **exactly one** of `tenant_id`, `companygpt_handle`, `azure_tenant_id`, `azure_tenant_domain`, `azure_subscription_id`, `gcp_project_id` or `aws_account_id`. For a CompanyGPT handle or a cloud identifier the Hub resolves the customer at create time (same rules as `data "innfactoryhub_tenant"`) and returns it as `tenant_id`.
+
+For CompanyGPT rollouts bind by **`companygpt_handle`** — the deployment name such as `innfactory`, `lmu` or `ksob`. The Hub keeps each handle unique across customers (no `409 ambiguous_lookup`), and every CompanyGPT stack knows its own name, whatever cloud it runs in; cloud identifiers remain for installations without a handle.
 
 | Change | Effect |
 |---|---|
 | `name`, `domain` | Updated in place (`PATCH`), `id` stays the same |
 | `cloud` | Forces a new environment |
-| Customer binding (any identifier or a configured `tenant_id`, including switching between them) | Forces a new environment |
+| Customer binding (`companygpt_handle`, any cloud identifier or a configured `tenant_id`, including switching between them) | Forces a new environment |
 
 `terraform destroy` deletes the environment in the Hub. Re-running `apply` without changes sends no write request.
 
@@ -31,9 +33,18 @@ provider "innfactoryhub" {
   # admin_key is best supplied via INNFACTORYHUB_ADMIN_KEY.
 }
 
+# Recommended for CompanyGPT: bind by the CompanyGPT handle (deployment name).
+resource "innfactoryhub_environment" "ai_gateway" {
+  companygpt_handle = "innfactory"
+  name              = "AI Gateway ${terraform.workspace}"
+  domain            = "gpt.innfactory.example"
+  cloud             = "azure"
+}
+
+# Alternative: let the Hub resolve the customer from a cloud identifier.
 data "azurerm_client_config" "current" {}
 
-resource "innfactoryhub_environment" "ai_gateway" {
+resource "innfactoryhub_environment" "by_azure_tenant" {
   azure_tenant_id = data.azurerm_client_config.current.tenant_id
   name            = "AI Gateway ${terraform.workspace}"
   domain          = "gpt.acme.example"
@@ -60,25 +71,26 @@ resource "innfactoryhub_environment" "by_hub_id" {
 ### Optional (set exactly one)
 
 - `tenant_id` (String) Hub customer (`tnt_…`) to bind to directly. Forces replacement when a configured value changes. Also computed (see below).
+- `companygpt_handle` (String) CompanyGPT handle (deployment name) of the customer, e.g. `innfactory` — recommended for CompanyGPT rollouts. 1–40 lower-case letters, digits and hyphens, starting and ending with a letter or digit (`^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$`), checked at plan time. Forces replacement.
 - `azure_tenant_id` (String) Azure (Entra ID) tenant / directory ID of the customer. Forces replacement.
 - `azure_tenant_domain` (String) Azure (Entra ID) tenant domain, e.g. `contoso.onmicrosoft.com`. Forces replacement.
 - `azure_subscription_id` (String) Azure subscription ID of the customer. Forces replacement.
 - `gcp_project_id` (String) GCP project ID of the customer. Forces replacement.
 - `aws_account_id` (String) AWS account ID (12-digit) of the customer. Forces replacement.
 
-Blank (whitespace-only) values are rejected at plan time.
+Blank (whitespace-only) values are rejected at plan time; so is a `companygpt_handle` in any other form than the Hub stores (upper case, surrounding spaces, underscores, more than 40 characters).
 
 ### Read-Only
 
 - `id` (String) Hub `environment_id`.
-- `tenant_id` (String) The resolved Hub customer when a cloud identifier is used.
+- `tenant_id` (String) The resolved Hub customer when a CompanyGPT handle or a cloud identifier is used.
 
 ## Errors
 
 | Hub answer | Meaning | Fix |
 |---|---|---|
-| `404 tenant_not_found` | No customer carries the identifier | Add the identifier to the customer in the Hub, or use `tenant_id` |
-| `409 ambiguous_lookup` | Several customers carry the identifier | Clean up the identifiers in the Hub, or use `tenant_id` |
+| `404 tenant_not_found` | No customer carries the identifier or CompanyGPT handle | Add it to the customer in the Hub, or use `tenant_id` |
+| `409 ambiguous_lookup` | Several customers carry the cloud identifier (never a handle) | Clean up the identifiers in the Hub, or use `companygpt_handle` or `tenant_id` |
 | `409 environment_exists` | The environment is already registered | `terraform import` it instead of creating it again |
 | `403 forbidden_read_only_key` | The admin key is read-only (`read_licensing`) | Apply with a `["read", "licensing"]` key |
 
@@ -90,4 +102,4 @@ Nothing is written to state when the Hub rejects a create.
 terraform import innfactoryhub_environment.ai_gateway <environment_id>
 ```
 
-After import, `tenant_id` and — when the Hub reports how the environment was registered (`identifier_used`) — the matching lookup attribute are filled in. Environments created in the portal carry no lookup identifier: import them into a configuration that binds them with `tenant_id`, otherwise the next plan replaces them.
+After import, `tenant_id` and — when the Hub reports how the environment was registered (`identifier_used`, e.g. `{type: "companygpt_handle", value: "innfactory"}`) — the matching lookup attribute (`companygpt_handle`, `azure_tenant_id`, …) are filled in. Environments created in the portal carry no lookup identifier: import them into a configuration that binds them with `tenant_id`, otherwise the next plan replaces them.
