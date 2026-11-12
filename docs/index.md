@@ -10,7 +10,7 @@ description: |-
 The `innfactoryhub` provider talks to both hubs — [innFactory Hub](https://hub.innfactory.cloud), the reseller billing portal, and the [innFactory AI Hub](https://hub.innfactory.ai), the licence and contract portal. Both serve the same tenant-lookup and API-key paths, so one provider covers:
 
 - Minting and revoking **API keys** scoped to a tenant (`innfactoryhub_api_key`), e.g. the companyADMIN maintenance key — both hubs.
-- Resolving a tenant from a cloud handle (`data.innfactoryhub_tenant`) — useful when a deploy environment knows only its own GCP project / Azure subscription / AWS account — both hubs.
+- Resolving a tenant from a cloud handle (`data.innfactoryhub_tenant`) — useful when a deploy environment knows only its own GCP project / Azure subscription / AWS account — both hubs. On the AI Hub also from the **CompanyGPT handle** (`companygpt_handle`, the deployment name such as `innfactory`), the recommended way for CompanyGPT rollouts.
 - Registering **environments** (`innfactoryhub_environment`) — one CompanyGPT / AI Gateway installation per customer — AI Hub only.
 - Issuing **licences** (`innfactoryhub_license`) for an environment, with the licence key as a sensitive value — AI Hub only. Air-gap operation (`air_gapped`; licence files for a gateway without internet access) is switched on by staff in the portal; Terraform can keep it or switch it off.
 
@@ -60,11 +60,11 @@ provider "innfactoryhub" {
 }
 
 resource "innfactoryhub_environment" "ai_gateway" {
-  provider        = innfactoryhub.aihub
-  azure_tenant_id = "00000000-0000-0000-0000-000000000000"
-  name            = "AI Gateway"
-  domain          = "gpt.acme.example"
-  cloud           = "azure"
+  provider          = innfactoryhub.aihub
+  companygpt_handle = "acme" # CompanyGPT deployment name; unique per customer
+  name              = "AI Gateway"
+  domain            = "gpt.acme.example"
+  cloud             = "azure"
 }
 
 resource "innfactoryhub_license" "ai_gateway" {

@@ -1,7 +1,20 @@
-# Resolve the Hub tenant by ONE identifier. Five inputs are supported;
+# Resolve the Hub tenant by ONE identifier. Six inputs are supported;
 # pass exactly one. Whichever you pass, the response carries ALL of the
-# tenant's identifier arrays so you can enumerate the other handles in
-# one call.
+# tenant's identifier arrays (and its CompanyGPT handles) so you can
+# enumerate the other handles in one call.
+
+# CompanyGPT handle = the deployment name (e.g. "innfactory", "lmu").
+# Recommended for CompanyGPT rollouts: unique per customer in the Hub and
+# known to every stack, unlike cloud identifiers. AI Hub only.
+provider "innfactoryhub" {
+  alias    = "aihub"
+  endpoint = "https://hub.innfactory.ai"
+}
+
+data "innfactoryhub_tenant" "by_handle" {
+  provider          = innfactoryhub.aihub
+  companygpt_handle = "innfactory"
+}
 
 data "innfactoryhub_tenant" "by_gcp" {
   gcp_project_id = "companygpt-acme-prod"
@@ -27,14 +40,15 @@ data "innfactoryhub_tenant" "by_hub_id" {
 }
 
 output "tenant_id" {
-  value = data.innfactoryhub_tenant.by_gcp.tenant_id
+  value = data.innfactoryhub_tenant.by_handle.tenant_id
 }
 
 output "tenant_other_handles" {
   value = {
-    gcp           = data.innfactoryhub_tenant.by_gcp.gcp_project_ids
-    azure_subs    = data.innfactoryhub_tenant.by_gcp.azure_subscription_ids
-    azure_tenants = data.innfactoryhub_tenant.by_gcp.azure_tenant_ids
-    aws           = data.innfactoryhub_tenant.by_gcp.aws_account_ids
+    companygpt    = data.innfactoryhub_tenant.by_handle.companygpt_handles
+    gcp           = data.innfactoryhub_tenant.by_handle.gcp_project_ids
+    azure_subs    = data.innfactoryhub_tenant.by_handle.azure_subscription_ids
+    azure_tenants = data.innfactoryhub_tenant.by_handle.azure_tenant_ids
+    aws           = data.innfactoryhub_tenant.by_handle.aws_account_ids
   }
 }

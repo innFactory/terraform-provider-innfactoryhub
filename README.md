@@ -4,7 +4,7 @@
 
 Manages API keys, environments and licences and reads tenant identifiers in [innFactory Hub](https://hub.innfactory.cloud) and the [innFactory AI Hub](https://hub.innfactory.ai). Both hubs serve the same tenant-lookup and API-key paths, so one provider talks to either.
 
-Intended primarily for CompanyGPT customer deployments: at deploy-time of a customer's stack, resolve the right Hub tenant from the GCP project ID (or Azure subscription / Azure tenant / AWS account / Hub tenant_id), register the customer's AI Gateway installation as an environment in the AI Hub, issue its licence, and mint the companyADMIN maintenance key — handed to the runtime as sensitive outputs.
+Intended primarily for CompanyGPT customer deployments: at deploy-time of a customer's stack, resolve the right Hub tenant from its CompanyGPT handle — the deployment name, e.g. `innfactory` (or the GCP project ID / Azure subscription / Azure tenant / AWS account / Hub tenant_id), register the customer's AI Gateway installation as an environment in the AI Hub, issue its licence, and mint the companyADMIN maintenance key — handed to the runtime as sensitive outputs.
 
 ## Quick start
 
@@ -38,6 +38,7 @@ Export `INNFACTORYHUB_ADMIN_KEY` with a system-scope admin key (mint one in *Hub
 
 | What | Key / attribute |
 |---|---|
+| Find the customer | `companygpt_handle` = the CompanyGPT deployment name (e.g. `innfactory`, `lmu`, `ksob`) — on `data "innfactoryhub_tenant"` and `innfactoryhub_environment`, instead of Azure tenant / subscription / project IDs |
 | Apply (CI, protected branch) | `INNFACTORYHUB_ADMIN_KEY` = system key `["read", "licensing"]`, at most **90 days** |
 | Plan (pull requests) | `INNFACTORYHUB_ADMIN_KEY` = system key `["read_licensing"]` (read-only; writes fail with `403 forbidden_read_only_key`) |
 | companyADMIN | `innfactoryhub_api_key`: `scope = "organization"`, `permissions = ["read_maintenance"]`, `expires_at` (required, ≤ 24 months), `rotation_trigger` — see [docs/resources/api_key.md](docs/resources/api_key.md) |
@@ -57,15 +58,15 @@ provider "innfactoryhub" {
 }
 
 resource "innfactoryhub_environment" "ai_gateway" {
-  provider        = innfactoryhub.aihub
-  azure_tenant_id = data.azurerm_client_config.current.tenant_id
-  name            = "AI Gateway"
-  domain          = "gpt.acme.example"
-  cloud           = "azure"
+  provider          = innfactoryhub.aihub
+  companygpt_handle = "innfactory" # the CompanyGPT deployment name
+  name              = "AI Gateway"
+  domain            = "gpt.innfactory.example"
+  cloud             = "azure"
 }
 ```
 
-Bind the environment with exactly one of `tenant_id`, `azure_tenant_id`, `azure_tenant_domain`, `azure_subscription_id`, `gcp_project_id`, `aws_account_id`. `name` and `domain` update in place; `cloud` and the customer binding force a new environment. Import with `terraform import innfactoryhub_environment.<name> <environment_id>`. See [docs/resources/environment.md](docs/resources/environment.md).
+Bind the environment with exactly one of `tenant_id`, `companygpt_handle`, `azure_tenant_id`, `azure_tenant_domain`, `azure_subscription_id`, `gcp_project_id`, `aws_account_id`. **For CompanyGPT rollouts use `companygpt_handle`**: the Hub keeps every handle unique across customers, and each stack knows its own deployment name whatever cloud it runs in — cloud identifiers can be shared between customers (`409 ambiguous_lookup`) or change when a stack moves. The handle is 1–40 lower-case letters, digits and hyphens (`^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$`), checked at plan time. `name` and `domain` update in place; `cloud` and the customer binding force a new environment. Import with `terraform import innfactoryhub_environment.<name> <environment_id>`. See [docs/resources/environment.md](docs/resources/environment.md).
 
 ### Issuing a licence in the innFactory AI Hub
 
@@ -90,17 +91,27 @@ The licence key (`lk_…`) is returned by the Hub only when the licence is issue
 
 A gateway without internet access runs on a licence file, which the Hub issues only in air-gap operation (`air_gapped`, AI Gateway only); an admin or the customer downloads it in the portal — the provider never fetches it. Only AI Hub staff switch air-gap operation on, in the portal: from Terraform (an API key) the Hub refuses it with `403 air_gapped_staff_only`, and a new licence with `air_gapped = true` already fails at plan time. Unset in the configuration, `air_gapped` stays as the Hub has it and is only read; `true` keeps it on; `false` switches it off in place, which revokes the licence files issued before — the plan warns about it.
 
-### Resolving a tenant — five ways
+### Resolving a tenant — six ways
 
 Pass exactly one of these to `data "innfactoryhub_tenant"`:
 
 | Input | Use when |
 |---|---|
+| `companygpt_handle` | **Recommended for CompanyGPT rollouts** (AI Hub only): the deployment name, e.g. `innfactory` — unique per customer |
 | `tenant_id` | You already know the Hub `tnt_…` id (direct fetch, no scan) |
 | `gcp_project_id` | The deploy env runs on GCP and knows its project ID |
 | `azure_subscription_id` | The deploy env knows its Azure subscription |
 | `azure_tenant_id` | You only know the Entra ID directory (Azure tenant) |
 | `aws_account_id` | The deploy env knows its 12-digit AWS account |
+
+Every lookup returns the tenant's identifier lists and `companygpt_handles` (empty on the innfactoryHUB, which has no handles).
+
+```hcl
+data "innfactoryhub_tenant" "self" {
+  provider          = innfactoryhub.aihub
+  companygpt_handle = "innfactory"
+}
+```
 
 ## Security model
 
@@ -124,7 +135,7 @@ go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 go build .
 ```
 
-The resource tests run real `terraform` plans against an in-process fake Hub (`httptest`) via `terraform-plugin-testing`'s `resource.UnitTest`. The fake mirrors the AI Hub's contract: key permissions (`licensing`, `read_licensing`, `read_maintenance`), key rotation, idempotent creates (and lost answers), out-of-band revocations. They need a Terraform CLI: either on `PATH`, at `TF_ACC_TERRAFORM_PATH`, or `TestMain` downloads the latest release (or `TF_ACC_TERRAFORM_VERSION`) once per test run and shares it with every test. No real Hub is ever called; the tests set `INNFACTORYHUB_INSECURE_ENDPOINT=1` with `INNFACTORYHUB_INSECURE_ENDPOINT_HOST=127.0.0.1` only for the loopback fake.
+The resource tests run real `terraform` plans against an in-process fake Hub (`httptest`) via `terraform-plugin-testing`'s `resource.UnitTest`. The fake mirrors the AI Hub's contract: tenant lookup (incl. CompanyGPT handles), key permissions (`licensing`, `read_licensing`, `read_maintenance`), key rotation, idempotent creates (and lost answers), out-of-band revocations. They need a Terraform CLI: either on `PATH`, at `TF_ACC_TERRAFORM_PATH`, or `TestMain` downloads the latest release (or `TF_ACC_TERRAFORM_VERSION`) once per test run and shares it with every test. No real Hub is ever called; the tests set `INNFACTORYHUB_INSECURE_ENDPOINT=1` with `INNFACTORYHUB_INSECURE_ENDPOINT_HOST=127.0.0.1` only for the loopback fake.
 
 For local debugging, run `./terraform-provider-innfactoryhub --debug` and follow the printed `TF_REATTACH_PROVIDERS` instructions.
 

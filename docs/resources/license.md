@@ -49,13 +49,12 @@ provider "innfactoryhub" {
   # admin_key is best supplied via INNFACTORYHUB_ADMIN_KEY.
 }
 
-data "azurerm_client_config" "current" {}
-
+# The Hub resolves the customer from its CompanyGPT handle (deployment name).
 resource "innfactoryhub_environment" "ai_gateway" {
-  azure_tenant_id = data.azurerm_client_config.current.tenant_id
-  name            = "AI Gateway ${terraform.workspace}"
-  domain          = "gpt.acme.example"
-  cloud           = "azure"
+  companygpt_handle = "acme"
+  name              = "AI Gateway ${terraform.workspace}"
+  domain            = "gpt.acme.example"
+  cloud             = "azure"
 }
 
 variable "max_users" {
