@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
@@ -30,6 +31,8 @@ resource "innfactoryhub_environment" "gw" {
 }
 
 func azureTenantLine() string { return fmt.Sprintf("azure_tenant_id = %q", alphaAzureTenantID) }
+
+func handleLine(handle string) string { return fmt.Sprintf("companygpt_handle = %q", handle) }
 
 // checkEnvironmentGone is the CheckDestroy for every environment test.
 func checkEnvironmentGone(hub *fakeHub) resource.TestCheckFunc {
@@ -213,6 +216,18 @@ func TestEnvironmentReplacement(t *testing.T) {
 			toCustomer: tenantLine(betaTenantID), toCloud: "gcp",
 			wantTenant: betaTenantID,
 		},
+		{
+			name:         "lookup identifier replaced by companygpt_handle",
+			fromCustomer: azureTenantLine(), fromCloud: "azure",
+			toCustomer: handleLine(alphaHandle), toCloud: "azure",
+			wantTenant: alphaTenantID,
+		},
+		{
+			name:         "companygpt_handle of the same customer changes",
+			fromCustomer: handleLine(alphaHandle), fromCloud: "azure",
+			toCustomer: handleLine(alphaStagingHandle), toCloud: "azure",
+			wantTenant: alphaTenantID,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -255,25 +270,32 @@ func TestEnvironmentReplacement(t *testing.T) {
 }
 
 // Import by environment id restores every attribute, including the lookup
-// identifier the environment was registered with.
+// identifier or CompanyGPT handle the environment was registered with.
 func TestEnvironmentImportRoundTrip(t *testing.T) {
-	hub := newFakeHub(t)
-	useFakeHubEnv(t)
-	cfg := envConfig(hub, azureTenantLine(), "Alpha AI Gateway", "gpt.alpha.example", "azure")
+	for name, customer := range map[string]string{
+		"azure_tenant_id":   azureTenantLine(),
+		"companygpt_handle": handleLine(alphaStagingHandle),
+	} {
+		t.Run(name, func(t *testing.T) {
+			hub := newFakeHub(t)
+			useFakeHubEnv(t)
+			cfg := envConfig(hub, customer, "Alpha AI Gateway", "gpt.alpha.example", "azure")
 
-	resource.UnitTest(t, resource.TestCase{
-		ProtoV6ProviderFactories: testProviderFactories(),
-		CheckDestroy:             checkEnvironmentGone(hub),
-		Steps: []resource.TestStep{
-			{Config: cfg},
-			{
-				Config:            cfg,
-				ResourceName:      envAddr,
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-		},
-	})
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testProviderFactories(),
+				CheckDestroy:             checkEnvironmentGone(hub),
+				Steps: []resource.TestStep{
+					{Config: cfg},
+					{
+						Config:            cfg,
+						ResourceName:      envAddr,
+						ImportState:       true,
+						ImportStateVerify: true,
+					},
+				},
+			})
+		})
+	}
 }
 
 // An environment an admin created in the portal is adopted by importing it
@@ -370,6 +392,12 @@ func TestEnvironmentConfigValidation(t *testing.T) {
 		{name: "domain with port", customer: azureTenantLine(), envName: "gw", domain: "gpt.alpha.example:8443", cloud: "azure", wantErr: `(?s)domain.*host name`},
 		{name: "domain upper case", customer: azureTenantLine(), envName: "gw", domain: "GPT.alpha.example", cloud: "azure", wantErr: `(?s)domain.*host name`},
 		{name: "domain without dot", customer: azureTenantLine(), envName: "gw", domain: "gateway", cloud: "azure", wantErr: `(?s)domain.*host name`},
+		{
+			name:     "companygpt_handle and lookup identifier",
+			customer: handleLine(alphaHandle) + "\n  " + azureTenantLine(),
+			envName:  "gw", domain: "gpt.alpha.example", cloud: "azure", wantErr: `Invalid Attribute Combination`,
+		},
+		{name: "companygpt_handle upper case", customer: handleLine("Alpha"), envName: "gw", domain: "gpt.alpha.example", cloud: "azure", wantErr: `(?s)companygpt_handle.*must be a CompanyGPT handle`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -401,6 +429,7 @@ func TestEnvironmentCreateBodyPerCustomerBinding(t *testing.T) {
 		wantBody map[string]any
 	}{
 		{name: "tenant_id", attr: "tenant_id", value: alphaTenantID, wantBody: map[string]any{"tenant_id": alphaTenantID}},
+		{name: "companygpt_handle", attr: "companygpt_handle", value: alphaHandle},
 		{name: "azure_tenant_id", attr: "azure_tenant_id", value: alphaAzureTenantID},
 		{name: "azure_tenant_domain", attr: "azure_tenant_domain", value: alphaTenantDomain},
 		{name: "azure_subscription_id", attr: "azure_subscription_id", value: alphaSubscription},
@@ -454,6 +483,11 @@ func TestEnvironmentCreateRejectedByHub(t *testing.T) {
 			name:     "identifier unknown",
 			customer: `azure_tenant_id = "00000000-0000-0000-0000-000000000000"`,
 			wantErr:  `(?s)404 tenant_not_found.*No\s+customer\s+in\s+the\s+Hub\s+carries\s+this\s+identifier`,
+		},
+		{
+			name:     "companygpt_handle unknown",
+			customer: handleLine("nobody"),
+			wantErr:  `(?s)404 tenant_not_found.*CompanyGPT\s+handle.*bind\s+the\s+environment\s+with\s+tenant_id`,
 		},
 		{
 			name:     "identifier shared by two customers",
@@ -572,4 +606,109 @@ func TestEnvironmentUpdateRejectedByHub(t *testing.T) {
 			},
 		},
 	})
+}
+
+// The CompanyGPT rollout by handle: the apply key ["read", "licensing"]
+// looks the customer up and registers the environment by companygpt_handle;
+// the plan key ["read_licensing"] looks it up again and plans nothing.
+func TestEnvironmentByHandleWithLicensingKeys(t *testing.T) {
+	hub := newFakeHub(t)
+	useFakeHubEnv(t)
+	cfg := func(key string) string {
+		return tenantConfig(hub.providerBlockWithKey(key), handleLine(alphaHandle)) + fmt.Sprintf(`
+resource "innfactoryhub_environment" "gw" {
+  companygpt_handle = %q
+  name              = "Alpha AI Gateway (${data.innfactoryhub_tenant.self.legal_name})"
+  domain            = "gpt.alpha.example"
+  cloud             = "azure"
+}
+`, alphaHandle)
+	}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		CheckDestroy:             checkEnvironmentGone(hub),
+		Steps: []resource.TestStep{
+			{
+				Config: cfg(testLicensingKey),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(envAddr, "tenant_id", alphaTenantID),
+					resource.TestCheckResourceAttr(envAddr, "companygpt_handle", alphaHandle),
+					resource.TestCheckResourceAttr(envAddr, "name", "Alpha AI Gateway (Alpha Demo GmbH)"),
+					resource.TestCheckNoResourceAttr(envAddr, "azure_tenant_id"),
+					func(s *terraform.State) error {
+						id := s.RootModule().Resources[envAddr].Primary.ID
+						want := &fakeIdentifier{Type: "companygpt_handle", Value: alphaHandle}
+						if e, _ := hub.environment(id); !reflect.DeepEqual(e.IdentifierUsed, want) {
+							return fmt.Errorf("environment %s registered with %+v, want %+v", id, e.IdentifierUsed, want)
+						}
+						return nil
+					},
+					func(*terraform.State) error { hub.resetCalls(); return nil },
+				),
+			},
+			{
+				Config: cfg(testReadLicensingKey),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+				Check: func(*terraform.State) error {
+					if w := hub.writeCalls(); len(w) != 0 {
+						return fmt.Errorf("plan wrote: %v", w)
+					}
+					return nil
+				},
+			},
+			// Destroy with the apply key; the read-only key cannot delete.
+			{Config: cfg(testLicensingKey)},
+		},
+	})
+}
+
+// applyRemote takes the binding from identifier_used, so an import restores
+// companygpt_handle like any other lookup identifier.
+func TestEnvironmentApplyRemoteIdentifierUsed(t *testing.T) {
+	cases := []struct {
+		name       string
+		used       *environmentIdentifier
+		wantHandle types.String
+		wantAzure  types.String
+	}{
+		{
+			name:       "companygpt_handle",
+			used:       &environmentIdentifier{Type: "companygpt_handle", Value: alphaHandle},
+			wantHandle: types.StringValue(alphaHandle), wantAzure: types.StringNull(),
+		},
+		{
+			name:       "cloud identifier",
+			used:       &environmentIdentifier{Type: "azure_tenant_id", Value: alphaAzureTenantID},
+			wantHandle: types.StringNull(), wantAzure: types.StringValue(alphaAzureTenantID),
+		},
+		{
+			name:       "tenant_id clears every lookup",
+			used:       &environmentIdentifier{Type: "tenant_id", Value: alphaTenantID},
+			wantHandle: types.StringNull(), wantAzure: types.StringNull(),
+		},
+		{
+			name:       "unknown kind keeps state",
+			used:       &environmentIdentifier{Type: "stackit_project_id", Value: "x"},
+			wantHandle: types.StringValue(betaHandle), wantAzure: types.StringNull(),
+		},
+		{
+			name:       "no identifier_used keeps state",
+			wantHandle: types.StringValue(betaHandle), wantAzure: types.StringNull(),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := environmentModel{CompanygptHandle: types.StringValue(betaHandle), AzureTenantID: types.StringNull()}
+			m.applyRemote(environmentDTO{
+				EnvironmentID: "env_1", TenantID: alphaTenantID, Name: "gw", Domain: "gpt.alpha.example", Cloud: "azure",
+				IdentifierUsed: tc.used,
+			})
+			if !m.CompanygptHandle.Equal(tc.wantHandle) || !m.AzureTenantID.Equal(tc.wantAzure) {
+				t.Fatalf("companygpt_handle %v, azure_tenant_id %v; want %v, %v", m.CompanygptHandle, m.AzureTenantID, tc.wantHandle, tc.wantAzure)
+			}
+		})
+	}
 }

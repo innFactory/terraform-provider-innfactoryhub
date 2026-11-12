@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -67,12 +69,21 @@ type fakeHub struct {
 	idempotencyKeys []string
 	// replayAs, when set, is the licence id every idempotent replay names.
 	replayAs string
+	// lastLookup is the query of the latest tenant lookup (nil = none).
+	lastLookup url.Values
+	// handlesOmitted plays innfactoryHUB (or an AI Hub before handles): the
+	// tenant lookup answers without companygpt_handles.
+	handlesOmitted bool
 }
 
 type fakeTenant struct {
 	TenantID    string              `json:"tenant_id"`
 	LegalName   string              `json:"legal_name"`
 	Identifiers map[string][]string `json:"identifiers"`
+	// CompanygptHandles are the tenant's CompanyGPT deployment names, a
+	// top-level field of the tenant (not one of the identifiers). The Hub
+	// keeps each handle unique across tenants.
+	CompanygptHandles []string `json:"companygpt_handles"`
 }
 
 type fakeIdentifier struct {
@@ -94,8 +105,12 @@ type fakeEnvironment struct {
 
 // Seeded customers. tnt_alpha is reachable via every lookup kind;
 // shared-proj belongs to two tenants and must be rejected as ambiguous.
+// CompanyGPT handles are unique, as in the Hub.
 const (
 	alphaTenantID      = "tnt_alpha"
+	alphaHandle        = "alpha"
+	alphaStagingHandle = "alpha-staging"
+	betaHandle         = "beta"
 	alphaAzureTenantID = "0f5c9c58-1c1e-4c51-9f0e-7c1f2a3b4c5d"
 	alphaSubscription  = "a1b2c3d4-0000-4000-8000-000000000001"
 	alphaGcpProject    = "alpha-prod"
@@ -115,10 +130,10 @@ func newFakeHub(t *testing.T) *fakeHub {
 				"azure_tenant_ids":       {alphaAzureTenantID},
 				"azure_tenant_domains":   {alphaTenantDomain},
 				"aws_account_ids":        {alphaAwsAccount},
-			}},
+			}, CompanygptHandles: []string{alphaHandle, alphaStagingHandle}},
 			{TenantID: betaTenantID, LegalName: "Beta GmbH", Identifiers: map[string][]string{
 				"gcp_project_ids": {sharedGcpProject},
-			}},
+			}, CompanygptHandles: []string{betaHandle}},
 			{TenantID: "tnt_gamma", LegalName: "Gamma GmbH", Identifiers: map[string][]string{
 				"gcp_project_ids": {sharedGcpProject},
 			}},
@@ -299,6 +314,21 @@ func (h *fakeHub) seedEnvironment(e fakeEnvironment) {
 	h.environments[e.EnvironmentID] = &cp
 }
 
+// lastLookupQuery is the query of the latest tenant lookup (nil = none).
+func (h *fakeHub) lastLookupQuery() url.Values {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastLookup
+}
+
+// omitHandles makes the tenant lookup answer without companygpt_handles, as
+// innfactoryHUB does.
+func (h *fakeHub) omitHandles() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.handlesOmitted = true
+}
+
 // removeEnvironment deletes out-of-band to simulate drift.
 func (h *fakeHub) removeEnvironment(id string) {
 	h.mu.Lock()
@@ -361,8 +391,13 @@ var lookupFields = map[string]string{
 	"aws_account_id":        "aws_account_ids",
 }
 
+// lookupKeys are the query keys GET /tenants/lookup accepts (exactly one per
+// request): tenant_id, companygpt_handle and every key of lookupFields.
+var lookupKeys = []string{"tenant_id", "companygpt_handle", "gcp_project_id", "azure_subscription_id", "azure_tenant_id", "azure_tenant_domain", "aws_account_id"}
+
 // resolveTenant mirrors GET /tenants/lookup semantics: tenant_id is a direct
-// fetch; every other key scans the identifier arrays. Caller holds mu.
+// fetch; companygpt_handle scans the tenants' handles, every other key the
+// identifier arrays. Caller holds mu.
 func (h *fakeHub) resolveTenant(kind, value string) (fakeTenant, int, string) {
 	if kind == "tenant_id" {
 		for _, t := range h.tenants {
@@ -372,16 +407,19 @@ func (h *fakeHub) resolveTenant(kind, value string) (fakeTenant, int, string) {
 		}
 		return fakeTenant{}, http.StatusNotFound, "tenant_not_found"
 	}
-	field, ok := lookupFields[kind]
-	if !ok {
+	var values func(fakeTenant) []string
+	switch field, ok := lookupFields[kind]; {
+	case kind == "companygpt_handle":
+		values = func(t fakeTenant) []string { return t.CompanygptHandles }
+	case ok:
+		values = func(t fakeTenant) []string { return t.Identifiers[field] }
+	default:
 		return fakeTenant{}, http.StatusBadRequest, "bad_request"
 	}
 	var hits []fakeTenant
 	for _, t := range h.tenants {
-		for _, v := range t.Identifiers[field] {
-			if v == value {
-				hits = append(hits, t)
-			}
+		if slices.Contains(values(t), value) {
+			hits = append(hits, t)
 		}
 	}
 	switch len(hits) {
@@ -396,9 +434,12 @@ func (h *fakeHub) resolveTenant(kind, value string) (fakeTenant, int, string) {
 
 func (h *fakeHub) lookupTenant(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	h.mu.Lock()
+	h.lastLookup = q
+	h.mu.Unlock()
 	var kind, value string
 	n := 0
-	for _, k := range []string{"tenant_id", "gcp_project_id", "azure_subscription_id", "azure_tenant_id", "azure_tenant_domain", "aws_account_id"} {
+	for _, k := range lookupKeys {
 		if v := q.Get(k); v != "" {
 			kind, value = k, v
 			n++
@@ -410,6 +451,7 @@ func (h *fakeHub) lookupTenant(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.Lock()
 	t, status, code := h.resolveTenant(kind, value)
+	handlesOmitted := h.handlesOmitted
 	h.mu.Unlock()
 	if status != 0 {
 		writeError(w, status, code, "lookup failed")
@@ -419,9 +461,11 @@ func (h *fakeHub) lookupTenant(w http.ResponseWriter, r *http.Request) {
 	for _, f := range []string{"gcp_project_ids", "azure_subscription_ids", "azure_tenant_ids", "azure_tenant_domains", "aws_account_ids"} {
 		ids[f] = append([]string{}, t.Identifiers[f]...)
 	}
-	writeData(w, http.StatusOK, map[string]any{"tenant": map[string]any{
-		"tenant_id": t.TenantID, "legal_name": t.LegalName, "identifiers": ids,
-	}})
+	tenant := map[string]any{"tenant_id": t.TenantID, "legal_name": t.LegalName, "identifiers": ids}
+	if !handlesOmitted {
+		tenant["companygpt_handles"] = append([]string{}, t.CompanygptHandles...)
+	}
+	writeData(w, http.StatusOK, map[string]any{"tenant": tenant})
 }
 
 func (h *fakeHub) listEnvironments(w http.ResponseWriter, _ *http.Request) {
@@ -652,4 +696,42 @@ provider "innfactoryhub" {
   endpoint = %q
 }
 `, h.URL())
+}
+
+// The fake Hub keeps the lookup contract the provider relies on: exactly
+// one key (otherwise 400), unknown values 404, values on two customers 409.
+func TestFakeHubTenantLookupContract(t *testing.T) {
+	hub := newFakeHub(t)
+	c := newClient(hub.URL(), testAdminKey, "test")
+	cases := []struct {
+		name     string
+		query    url.Values
+		wantCode string
+		wantID   string
+	}{
+		{name: "handle", query: url.Values{"companygpt_handle": {alphaStagingHandle}}, wantID: alphaTenantID},
+		{name: "handle and another key", query: url.Values{"companygpt_handle": {alphaHandle}, "gcp_project_id": {alphaGcpProject}}, wantCode: "400 bad_request"},
+		{name: "handle and tenant_id", query: url.Values{"companygpt_handle": {alphaHandle}, "tenant_id": {alphaTenantID}}, wantCode: "400 bad_request"},
+		{name: "no key", query: url.Values{}, wantCode: "400 bad_request"},
+		{name: "unknown handle", query: url.Values{"companygpt_handle": {"nobody"}}, wantCode: "404 tenant_not_found"},
+		{name: "identifier on two customers", query: url.Values{"gcp_project_id": {sharedGcpProject}}, wantCode: "409 ambiguous_lookup"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var env envelope[tenantLookupResponse]
+			err := c.do(context.Background(), http.MethodGet, "/api/v1/admin/tenants/lookup", tc.query, nil, &env)
+			if tc.wantCode != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantCode) {
+					t.Fatalf("got %v, want %s", err, tc.wantCode)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("lookup failed: %v", err)
+			}
+			if env.Data.Tenant.TenantID != tc.wantID {
+				t.Fatalf("tenant %q, want %q", env.Data.Tenant.TenantID, tc.wantID)
+			}
+		})
+	}
 }

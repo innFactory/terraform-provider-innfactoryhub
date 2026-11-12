@@ -30,7 +30,8 @@ const environmentsPath = "/api/v1/admin/environments"
 
 // environmentResource registers a customer installation (CompanyGPT /
 // AI Gateway) in the Hub. The Hub resolves the customer from exactly one
-// cloud identifier — or takes tenant_id directly — at create time.
+// CompanyGPT handle or cloud identifier — or takes tenant_id directly — at
+// create time.
 type environmentResource struct {
 	client *httpClient
 }
@@ -45,6 +46,7 @@ type environmentModel struct {
 	Domain              types.String `tfsdk:"domain"`
 	Cloud               types.String `tfsdk:"cloud"`
 	TenantID            types.String `tfsdk:"tenant_id"`
+	CompanygptHandle    types.String `tfsdk:"companygpt_handle"`
 	AzureTenantID       types.String `tfsdk:"azure_tenant_id"`
 	AzureTenantDomain   types.String `tfsdk:"azure_tenant_domain"`
 	AzureSubscriptionID types.String `tfsdk:"azure_subscription_id"`
@@ -56,12 +58,13 @@ type environmentModel struct {
 var environmentClouds = []string{"azure", "gcp", "aws", "stackit", "other"}
 
 // customerBindingAttrs are the mutually exclusive ways to name the customer.
-var customerBindingAttrs = []string{"tenant_id", "azure_tenant_id", "azure_tenant_domain", "azure_subscription_id", "gcp_project_id", "aws_account_id"}
+var customerBindingAttrs = []string{"tenant_id", "companygpt_handle", "azure_tenant_id", "azure_tenant_domain", "azure_subscription_id", "gcp_project_id", "aws_account_id"}
 
 // lookups maps each lookup key of GET /tenants/lookup (and of the
 // environment's `lookup` body) to its model field.
 func (m *environmentModel) lookups() map[string]*types.String {
 	return map[string]*types.String{
+		"companygpt_handle":     &m.CompanygptHandle,
 		"azure_tenant_id":       &m.AzureTenantID,
 		"azure_tenant_domain":   &m.AzureTenantDomain,
 		"azure_subscription_id": &m.AzureSubscriptionID,
@@ -75,17 +78,17 @@ func (r *environmentResource) Metadata(_ context.Context, req resource.MetadataR
 }
 
 func (r *environmentResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
-	lookupAttr := func(desc string) schema.StringAttribute {
+	lookupAttr := func(desc string, v validator.String) schema.StringAttribute {
 		return schema.StringAttribute{
 			Optional:      true,
 			Description:   desc + " Resolved to the customer by the Hub at create time. Changing it forces a new environment.",
-			Validators:    []validator.String{notBlank},
+			Validators:    []validator.String{v},
 			PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 		}
 	}
 	resp.Schema = schema.Schema{
 		Description: "Registers an environment (one CompanyGPT / AI Gateway installation of a customer) in the innFactory AI Hub. " +
-			"Bind it to the customer with exactly one of `tenant_id`, `azure_tenant_id`, `azure_tenant_domain`, `azure_subscription_id`, `gcp_project_id`, `aws_account_id`. " +
+			"Bind it to the customer with exactly one of `tenant_id`, `companygpt_handle`, `azure_tenant_id`, `azure_tenant_domain`, `azure_subscription_id`, `gcp_project_id`, `aws_account_id`. " +
 			"`name` and `domain` change in place; `cloud` and the customer binding force a new environment.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
@@ -126,11 +129,13 @@ func (r *environmentResource) Schema(_ context.Context, _ resource.SchemaRequest
 					stringplanmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
-			"azure_tenant_id":       lookupAttr("Azure (Entra ID) tenant / directory ID of the customer."),
-			"azure_tenant_domain":   lookupAttr("Azure (Entra ID) tenant domain of the customer, e.g. `contoso.onmicrosoft.com`."),
-			"azure_subscription_id": lookupAttr("Azure subscription ID of the customer."),
-			"gcp_project_id":        lookupAttr("GCP project ID of the customer."),
-			"aws_account_id":        lookupAttr("AWS account ID (12-digit) of the customer."),
+			"companygpt_handle": lookupAttr("CompanyGPT handle (deployment name) of the customer, e.g. `innfactory` — preferred over cloud identifiers for CompanyGPT rollouts. "+
+				companygptHandleFormat+"; checked at plan time.", companygptHandle),
+			"azure_tenant_id":       lookupAttr("Azure (Entra ID) tenant / directory ID of the customer.", notBlank),
+			"azure_tenant_domain":   lookupAttr("Azure (Entra ID) tenant domain of the customer, e.g. `contoso.onmicrosoft.com`.", notBlank),
+			"azure_subscription_id": lookupAttr("Azure subscription ID of the customer.", notBlank),
+			"gcp_project_id":        lookupAttr("GCP project ID of the customer.", notBlank),
+			"aws_account_id":        lookupAttr("AWS account ID (12-digit) of the customer.", notBlank),
 		},
 	}
 }
@@ -195,7 +200,7 @@ type environmentPatchBody struct {
 // environmentCreateHints tell the operator how to resolve the Hub's
 // documented create rejections.
 var environmentCreateHints = map[string]string{
-	"tenant_not_found":   "No customer in the Hub carries this identifier. Add it to the customer's identifiers in the Hub, or bind the environment with tenant_id.",
+	"tenant_not_found":   "No customer in the Hub carries this identifier or CompanyGPT handle. Add it to the customer in the Hub, or bind the environment with tenant_id.",
 	"ambiguous_lookup":   "Several customers in the Hub carry this identifier. Clean up their identifiers in the Hub, or bind the environment with tenant_id.",
 	"environment_exists": "This environment is already registered in the Hub. Adopt it with `terraform import <address> <environment_id>` instead of creating it again.",
 }

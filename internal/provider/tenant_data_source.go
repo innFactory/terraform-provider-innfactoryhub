@@ -8,6 +8,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
@@ -27,11 +28,13 @@ func newTenantDataSource() datasource.DataSource {
 type tenantDataModel struct {
 	ID                   types.String `tfsdk:"id"`
 	TenantID             types.String `tfsdk:"tenant_id"`
+	CompanygptHandle     types.String `tfsdk:"companygpt_handle"`
 	GcpProjectID         types.String `tfsdk:"gcp_project_id"`
 	AzureSubscriptionID  types.String `tfsdk:"azure_subscription_id"`
 	AzureTenantID        types.String `tfsdk:"azure_tenant_id"`
 	AwsAccountID         types.String `tfsdk:"aws_account_id"`
 	LegalName            types.String `tfsdk:"legal_name"`
+	CompanygptHandles    types.List   `tfsdk:"companygpt_handles"`
 	GcpProjectIDs        types.List   `tfsdk:"gcp_project_ids"`
 	AzureSubscriptionIDs types.List   `tfsdk:"azure_subscription_ids"`
 	AzureTenantIDs       types.List   `tfsdk:"azure_tenant_ids"`
@@ -44,7 +47,7 @@ func (d *tenantDataSource) Metadata(_ context.Context, req datasource.MetadataRe
 
 func (d *tenantDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Resolves a Hub tenant by one of its identifiers. Exactly one of `tenant_id`, `gcp_project_id`, `azure_subscription_id`, `azure_tenant_id` (Entra ID directory), or `aws_account_id` must be set. Returns the tenant_id, legal_name, and ALL identifier arrays so a single call gives the caller the tenant's full cross-cloud footprint.",
+		Description: "Resolves a Hub tenant by one of its identifiers. Exactly one of `tenant_id`, `companygpt_handle` (AI Hub), `gcp_project_id`, `azure_subscription_id`, `azure_tenant_id` (Entra ID directory), or `aws_account_id` must be set. Returns the tenant_id, legal_name, and ALL identifier arrays so a single call gives the caller the tenant's full cross-cloud footprint.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:    true,
@@ -54,6 +57,12 @@ func (d *tenantDataSource) Schema(_ context.Context, _ datasource.SchemaRequest,
 				Optional:    true,
 				Computed:    true,
 				Description: "Hub tenant_id. Set as input for a direct fetch (no cloud-handle scan); read as output otherwise.",
+			},
+			"companygpt_handle": schema.StringAttribute{
+				Optional: true,
+				Description: "CompanyGPT handle (deployment name) to look up, e.g. `innfactory` — innFactory AI Hub only. " +
+					"Unique per customer, so preferred over cloud identifiers for CompanyGPT rollouts. " + companygptHandleFormat + "; checked at plan time.",
+				Validators: []validator.String{companygptHandle},
 			},
 			"gcp_project_id": schema.StringAttribute{
 				Optional:    true,
@@ -74,6 +83,11 @@ func (d *tenantDataSource) Schema(_ context.Context, _ datasource.SchemaRequest,
 			"legal_name": schema.StringAttribute{
 				Computed:    true,
 				Description: "Legal name of the tenant as configured in the Hub.",
+			},
+			"companygpt_handles": schema.ListAttribute{
+				Computed:    true,
+				ElementType: types.StringType,
+				Description: "All CompanyGPT handles of this tenant. Empty when the Hub keeps none (innfactoryHUB has no handles).",
 			},
 			"gcp_project_ids": schema.ListAttribute{
 				Computed:    true,
@@ -113,9 +127,10 @@ func (d *tenantDataSource) Configure(_ context.Context, req datasource.Configure
 
 type tenantLookupResponse struct {
 	Tenant struct {
-		TenantID    string `json:"tenant_id"`
-		LegalName   string `json:"legal_name"`
-		Identifiers struct {
+		TenantID          string   `json:"tenant_id"`
+		LegalName         string   `json:"legal_name"`
+		CompanygptHandles []string `json:"companygpt_handles"`
+		Identifiers       struct {
 			GcpProjectIDs        []string `json:"gcp_project_ids"`
 			AzureSubscriptionIDs []string `json:"azure_subscription_ids"`
 			AzureTenantIDs       []string `json:"azure_tenant_ids"`
@@ -149,6 +164,10 @@ func (d *tenantDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 		q.Set("tenant_id", v)
 		count++
 	}
+	if v, ok := trimmed(cfg.CompanygptHandle); ok {
+		q.Set("companygpt_handle", v)
+		count++
+	}
 	if v, ok := trimmed(cfg.GcpProjectID); ok {
 		q.Set("gcp_project_id", v)
 		count++
@@ -168,7 +187,7 @@ func (d *tenantDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 	if count != 1 {
 		resp.Diagnostics.AddError(
 			"Exactly one identifier required",
-			fmt.Sprintf("Set exactly one of tenant_id, gcp_project_id, azure_subscription_id, azure_tenant_id, aws_account_id (got %d non-empty after trim).", count),
+			fmt.Sprintf("Set exactly one of tenant_id, companygpt_handle, gcp_project_id, azure_subscription_id, azure_tenant_id, aws_account_id (got %d non-empty after trim).", count),
 		)
 		return
 	}
@@ -183,6 +202,9 @@ func (d *tenantDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 	cfg.ID = types.StringValue(t.TenantID)
 	cfg.TenantID = types.StringValue(t.TenantID)
 	cfg.LegalName = types.StringValue(t.LegalName)
+	// innfactoryHUB (and an AI Hub before handles) omits the field: an empty
+	// list, not null.
+	cfg.CompanygptHandles = strList(ctx, &resp.Diagnostics, append([]string{}, t.CompanygptHandles...))
 	cfg.GcpProjectIDs = strList(ctx, &resp.Diagnostics, t.Identifiers.GcpProjectIDs)
 	cfg.AzureSubscriptionIDs = strList(ctx, &resp.Diagnostics, t.Identifiers.AzureSubscriptionIDs)
 	cfg.AzureTenantIDs = strList(ctx, &resp.Diagnostics, t.Identifiers.AzureTenantIDs)
