@@ -124,7 +124,7 @@ go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 go build .
 ```
 
-The resource tests run real `terraform` plans against an in-process fake Hub (`httptest`) via `terraform-plugin-testing`'s `resource.UnitTest`. The fake mirrors the AI Hub's contract: key permissions (`licensing`, `read_licensing`, `read_maintenance`), key rotation, idempotent creates (and lost answers), out-of-band revocations. They need a Terraform CLI: either on `PATH`, at `TF_ACC_TERRAFORM_PATH`, or the harness downloads the latest release. No real Hub is ever called; the tests set `INNFACTORYHUB_INSECURE_ENDPOINT=1` with `INNFACTORYHUB_INSECURE_ENDPOINT_HOST=127.0.0.1` only for the loopback fake.
+The resource tests run real `terraform` plans against an in-process fake Hub (`httptest`) via `terraform-plugin-testing`'s `resource.UnitTest`. The fake mirrors the AI Hub's contract: key permissions (`licensing`, `read_licensing`, `read_maintenance`), key rotation, idempotent creates (and lost answers), out-of-band revocations. They need a Terraform CLI: either on `PATH`, at `TF_ACC_TERRAFORM_PATH`, or `TestMain` downloads the latest release (or `TF_ACC_TERRAFORM_VERSION`) once per test run and shares it with every test. No real Hub is ever called; the tests set `INNFACTORYHUB_INSECURE_ENDPOINT=1` with `INNFACTORYHUB_INSECURE_ENDPOINT_HOST=127.0.0.1` only for the loopback fake.
 
 For local debugging, run `./terraform-provider-innfactoryhub --debug` and follow the printed `TF_REATTACH_PROVIDERS` instructions.
 
