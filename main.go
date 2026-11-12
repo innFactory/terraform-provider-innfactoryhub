@@ -1,7 +1,7 @@
 // Terraform provider entrypoint. Registered with the Plugin Framework's
 // serve loop. Address must match the registry: registry.terraform.io/
-// innfactory/innfactoryhub. The `debug` flag enables locally-run mode
-// for `make test-acc` against a freshly-built binary.
+// innfactory/innfactoryhub. The `debug` flag runs the provider as a debug
+// server; terraform then attaches via TF_REATTACH_PROVIDERS.
 package main
 
 import (
