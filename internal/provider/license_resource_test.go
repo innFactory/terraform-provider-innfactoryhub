@@ -185,7 +185,7 @@ func TestLicenseCreateUnbilled(t *testing.T) {
 			name:         "internal with the Hub default",
 			attrs:        licenseAttrs{"unbilled_reason": `"internal"`},
 			wantUnbilled: map[string]any{"reason": "internal"},
-			wantMaxUntil: today.AddDate(0, 12, 0).Format(isoDay),
+			wantMaxUntil: addMonthsClamped(today, 12).Format(isoDay),
 		},
 		{
 			name:         "partner with explicit end",
@@ -445,7 +445,7 @@ func TestLicenseUpdatePlanKeepsHubDefaults(t *testing.T) {
 	useFakeHubEnv(t)
 	trial := gatewayLicense().with(licenseAttrs{"contract_position_id": "", "unbilled_reason": `"trial"`})
 	trialEnd := fakeToday().AddDate(0, 0, 30).Format(isoDay)
-	internalEnd := fakeToday().AddDate(0, 12, 0).Format(isoDay)
+	internalEnd := addMonthsClamped(fakeToday(), 12).Format(isoDay)
 
 	var id, key string
 	resource.UnitTest(t, resource.TestCase{

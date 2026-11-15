@@ -807,3 +807,244 @@ func TestLicensePortalChangeOfPinnedEndIsKept(t *testing.T) {
 		},
 	})
 }
+
+func hubWrites(hub *fakeHub) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		if w := hub.writeCalls(); len(w) != 0 {
+			return fmt.Errorf("Terraform wrote: %v", w)
+		}
+		return nil
+	}
+}
+
+func emptyPlan() resource.ConfigPlanChecks {
+	return resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}}
+}
+
+// Renewal decides by the Hub's link. Staff set the licence to a trial in the
+// portal (end inside the window), the configuration still says partner:
+// no renewal as partner, only a warning.
+func TestLicenseRenewalPortalTrialIsNotRenewedAsPartner(t *testing.T) {
+	fixToday(t, "2026-11-15")
+	hub := newLicenseHub(t)
+	hub.enableRenewal()
+	useFakeHubEnv(t)
+	cfg := licenseConfig(hub, unbilledGateway("partner"))
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		CheckDestroy:             checkLicensesEnded(hub),
+		Steps: []resource.TestStep{
+			{Config: cfg, Check: captureAttr(licAddr, "id", &id)},
+			{
+				PreConfig: func() {
+					hub.mu.Lock()
+					l := hub.licenses[id]
+					l.Unbilled.Reason, l.Unbilled.MaxUntil, l.ValidUntil = "trial", day(10), day(10)
+					hub.mu.Unlock()
+					hub.resetCalls()
+				},
+				Config:           cfg,
+				ConfigPlanChecks: emptyPlan(),
+				Check: resource.ComposeAggregateTestCheckFunc(hubWrites(hub), func(*terraform.State) error {
+					if l, _ := hub.license(id); l.Unbilled.Reason != "trial" || l.Unbilled.MaxUntil != day(10) {
+						return fmt.Errorf("the Hub's trial was changed: %+v", l.Unbilled)
+					}
+					return nil
+				}),
+			},
+		},
+	})
+}
+
+// Staff change partner -> internal; the renewal inside the window keeps the
+// Hub's reason (internal), not the configured one.
+func TestLicenseRenewalKeepsTheHubsReason(t *testing.T) {
+	fixToday(t, "2026-11-15")
+	hub := newLicenseHub(t)
+	hub.enableRenewal()
+	useFakeHubEnv(t)
+	cfg := licenseConfig(hub, unbilledGateway("partner"))
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		CheckDestroy:             checkLicensesEnded(hub),
+		Steps: []resource.TestStep{
+			{Config: cfg, Check: captureAttr(licAddr, "id", &id)},
+			{
+				PreConfig: func() {
+					hub.mu.Lock()
+					l := hub.licenses[id]
+					l.Unbilled.Reason, l.Unbilled.MaxUntil, l.ValidUntil = "internal", day(10), day(10)
+					hub.mu.Unlock()
+				},
+				Config: cfg,
+				Check: func(*terraform.State) error {
+					l, _ := hub.license(id)
+					if l.Unbilled.Reason != "internal" || l.Unbilled.MaxUntil != addMonthsClamped(fakeToday(), 12).Format(isoDay) {
+						return fmt.Errorf("Hub link after the renewal: %+v", l.Unbilled)
+					}
+					return nil
+				},
+			},
+			{Config: cfg, ConfigPlanChecks: emptyPlan()},
+		},
+	})
+}
+
+// The configuration says partner, staff link a contract position, the
+// contract ends and the Hub expires the licence: Terraform neither revives it
+// as unbilled nor drops the position. Same for a trial configuration (no
+// error, no blocked workspace).
+func TestLicenseRenewalNeverTouchesAPositionStaffSet(t *testing.T) {
+	for _, reason := range []string{"partner", "trial"} {
+		t.Run(reason, func(t *testing.T) {
+			fixToday(t, "2026-11-15")
+			hub := newLicenseHub(t)
+			hub.enableRenewal()
+			useFakeHubEnv(t)
+			cfg := licenseConfig(hub, unbilledGateway(reason).with(licenseAttrs{"unbilled_max_until": fmt.Sprintf("%q", day(50))}))
+			var id string
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testProviderFactories(),
+				CheckDestroy:             checkLicensesEnded(hub),
+				Steps: []resource.TestStep{
+					{Config: cfg, Check: captureAttr(licAddr, "id", &id)},
+					{
+						PreConfig:        func() { hub.linkPositionOutOfBand(id, alphaPositionID); hub.resetCalls() },
+						Config:           cfg,
+						ConfigPlanChecks: emptyPlan(),
+						Check:            hubWrites(hub),
+					},
+					{
+						// The contract ended: the Hub's nightly job expired the licence.
+						PreConfig: func() {
+							hub.mu.Lock()
+							l := hub.licenses[id]
+							l.Status, l.ValidUntil = "expired", day(-1)
+							hub.mu.Unlock()
+							hub.resetCalls()
+						},
+						Config:           cfg,
+						ConfigPlanChecks: emptyPlan(),
+						Check: resource.ComposeAggregateTestCheckFunc(hubWrites(hub), func(*terraform.State) error {
+							if l, _ := hub.license(id); l.ContractPositionID == nil || l.Unbilled != nil || l.Status != "expired" {
+								return fmt.Errorf("the Hub's link was touched: %+v %v %s", l.Unbilled, l.ContractPositionID, l.Status)
+							}
+							return nil
+						}),
+					},
+				},
+			})
+		})
+	}
+}
+
+// The configuration names a position, staff switch the licence to partner in
+// the portal: when it runs out, Terraform renews it as the Hub's partner —
+// reason and (absent) position stay as the Hub has them.
+func TestLicenseRenewalFollowsAnUnbilledLinkStaffSet(t *testing.T) {
+	fixToday(t, "2026-11-15")
+	hub := newLicenseHub(t)
+	hub.enableRenewal()
+	useFakeHubEnv(t)
+	cfg := licenseConfig(hub, gatewayLicense())
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		CheckDestroy:             checkLicensesEnded(hub),
+		Steps: []resource.TestStep{
+			{Config: cfg, Check: captureAttr(licAddr, "id", &id)},
+			{
+				PreConfig: func() {
+					hub.mu.Lock()
+					l := hub.licenses[id]
+					old := l.ContractPositionID
+					l.ContractPositionID, l.ContractID = nil, nil
+					l.Unbilled = &fakeUnbilled{Reason: "partner", MaxUntil: day(10)}
+					l.ValidUntil = day(10)
+					hub.linkPositionLocked(l, old)
+					hub.mu.Unlock()
+				},
+				Config: cfg,
+				Check: func(*terraform.State) error {
+					l, _ := hub.license(id)
+					if l.ContractPositionID != nil || l.Unbilled == nil || l.Unbilled.Reason != "partner" || l.Unbilled.MaxUntil != addMonthsClamped(fakeToday(), 12).Format(isoDay) {
+						return fmt.Errorf("Hub link after the renewal: %+v %v", l.Unbilled, l.ContractPositionID)
+					}
+					return nil
+				},
+			},
+			{Config: cfg, ConfigPlanChecks: emptyPlan()},
+		},
+	})
+}
+
+// A pin removed from the configuration after staff moved the end: the end
+// follows the Hub, without a write, and stays so.
+func TestLicenseRemovedPinTakesTheHubsEnd(t *testing.T) {
+	fixToday(t, "2026-11-15")
+	hub := newLicenseHub(t)
+	hub.enableRenewal()
+	useFakeHubEnv(t)
+	pinned := licenseConfig(hub, unbilledGateway("partner").with(licenseAttrs{"unbilled_max_until": fmt.Sprintf("%q", day(50))}))
+	unpinned := licenseConfig(hub, unbilledGateway("partner"))
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		CheckDestroy:             checkLicensesEnded(hub),
+		Steps: []resource.TestStep{
+			{Config: pinned, Check: captureAttr(licAddr, "id", &id)},
+			{PreConfig: func() { hub.setUnbilledEndOutOfBand(id, day(100), "active") }, Config: pinned, ConfigPlanChecks: emptyPlan()},
+			{
+				PreConfig: func() { hub.resetCalls() },
+				Config:    unpinned,
+				Check: resource.ComposeAggregateTestCheckFunc(hubWrites(hub),
+					resource.TestCheckResourceAttr(licAddr, "unbilled_max_until", day(100))),
+			},
+			{Config: unpinned, ConfigPlanChecks: emptyPlan()},
+		},
+	})
+}
+
+// An import keeps the simple rule until its first apply; that apply
+// remembers the configuration, after which a portal reason change stays.
+func TestLicenseImportRemembersConfigurationAtFirstApply(t *testing.T) {
+	fixToday(t, "2026-11-15")
+	hub := newLicenseHub(t)
+	hub.enableRenewal()
+	useFakeHubEnv(t)
+	id := seedLicenseIn(hub, "lic_import000003", alphaEnvID, "ai-gateway", "active")
+	hub.mu.Lock()
+	hub.licenses[id].Unbilled = &fakeUnbilled{Reason: "partner", MaxUntil: day(200)}
+	hub.licenses[id].ValidUntil = day(200)
+	hub.mu.Unlock()
+	base := unbilledGateway("partner").with(licenseAttrs{"domains": `["gpt.example.com"]`, "max_users": "5"})
+	cfg := licenseConfig(hub, base)
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		CheckDestroy:             func(*terraform.State) error { return nil },
+		Steps: []resource.TestStep{
+			{Config: cfg, ImportState: true, ResourceName: licAddr, ImportStateId: id, ImportStatePersist: true},
+			{Config: licenseConfig(hub, base.with(licenseAttrs{"max_users": "6"}))}, // the first apply
+			{
+				PreConfig: func() {
+					hub.mu.Lock()
+					hub.licenses[id].Unbilled.Reason = "internal"
+					hub.mu.Unlock()
+					hub.resetCalls()
+				},
+				Config:           licenseConfig(hub, base.with(licenseAttrs{"max_users": "6"})),
+				ConfigPlanChecks: emptyPlan(),
+				Check:            hubWrites(hub),
+			},
+		},
+	})
+}
+
+// The existing unbilled-licence tests on a leap day: the Hub's 12-month limit
+// is clamped (2029-02-28), not rolled over.
+func TestLicenseUnbilledOnALeapDay(t *testing.T) {
+	t.Run("create", func(t *testing.T) { fixToday(t, "2028-02-29"); TestLicenseCreateUnbilled(t) })
+	t.Run("defaults", func(t *testing.T) { fixToday(t, "2028-02-29"); TestLicenseUpdatePlanKeepsHubDefaults(t) })
+}
