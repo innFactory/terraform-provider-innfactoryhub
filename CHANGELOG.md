@@ -1,8 +1,8 @@
 # Changelog
 
-## v0.2.0 — unreleased
+## v0.2.0 — 2026-11-15
 
-Prepared for release; the tag `v0.2.0` is pushed manually after approval (GoReleaser publishes to the Registry). Needs the AI Hub with key permissions `licensing` / `read_licensing` / `read_maintenance`, `Idempotency-Key` and `X-Audit-Context`. `air_gapped` is sent only when it is set; a Hub without `params.air_gapped` (before 2026-11-10) refuses it then. `companygpt_handle` needs an AI Hub that keeps CompanyGPT handles on the tenant; an older Hub refuses the lookup and the environment create with `400 bad_request`.
+Needs the AI Hub with key permissions `licensing` / `read_licensing` / `read_maintenance`, `Idempotency-Key` and `X-Audit-Context`. `air_gapped` is sent only when it is set; a Hub without `params.air_gapped` (before 2026-11-10) refuses it then. `companygpt_handle` needs an AI Hub that keeps CompanyGPT handles on the tenant; an older Hub refuses the lookup and the environment create with `400 bad_request`.
 
 **Upgrade notes**
 
