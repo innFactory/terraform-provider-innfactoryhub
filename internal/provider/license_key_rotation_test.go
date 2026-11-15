@@ -408,6 +408,8 @@ func TestLicenseSuspendedInHubStaysSuspended(t *testing.T) {
 					},
 				),
 			},
+			// Staff resume it, so that destroy can end it.
+			{PreConfig: func() { hub.resumeLicenseOutOfBand(id) }, Config: cfg},
 		},
 	})
 }

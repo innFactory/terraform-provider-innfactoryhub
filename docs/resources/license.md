@@ -31,6 +31,14 @@ To take a licence away, **end or suspend it in the Hub** (portal). Terraform doe
 - An **ended** licence stays in state with `status = "ended"` and is **not** re-issued. Every plan that keeps the resource fails with `Licence ended in the AI Hub – change rotation_trigger to issue a new one`. Change `rotation_trigger` to issue a new licence (with a new key) on purpose — the plan then warns `Re-issuing a licence that was ended in the AI Hub` next to the replacement — or remove the resource from the configuration.
 - A **key rotated or revoked in the Hub** (portal, customer self-service) leaves the key in state dead: `key_status = "revoked"`, and every plan fails with `Licence key revoked in the AI Hub – change rotation_trigger to issue a new key` until `rotation_trigger` changes, which rotates the key of the same licence in place. Terraform never ships the revoked key silently, and never rotates on its own.
 
+### Billing link and air-gap set in the portal
+
+Staff may link a Terraform licence to a **contract position** in the portal later, and switch `air_gapped`. Terraform does not undo that. After issue, the AI Hub's billing link wins: while the licence hangs on a position and the configuration still says `unbilled_reason`, the plan is empty apart from the warning `Billing is linked to a contract position in the AI Hub – Terraform leaves it unchanged`. A different `contract_position_id` in the configuration is taken over; `contract_position_id` equal to the Hub's changes nothing. `air_gapped` unset keeps the Hub's value (never sent). Because the position can change in the Hub, `contract_position_id` and `unbilled_reason` are also computed.
+
+### Suspended licences
+
+A licence suspended in the Hub (emergency stop) cannot be ended or replaced by an API key: the Hub answers `409 license_suspended` to `DELETE` and to a new licence for the same environment and product. The provider passes this on as `suspended in the AI Hub (emergency stop) — Terraform cannot end or replace it … until a staff member resumes it in the portal`; resume it in the portal, then apply again.
+
 ### Renewing unbilled licences
 
 The portal no longer changes licences issued by Terraform (`managed_by = "terraform"`; it only suspends them in an emergency), so Terraform renews them. The Hub reports per licence whether one is due (`renewal_due`, `renewal_reason`); a Hub from before that (AI Hub Spec 003) reports nothing and the attributes stay null — nothing is planned then.

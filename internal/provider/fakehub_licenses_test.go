@@ -297,6 +297,21 @@ func (h *fakeHub) suspendLicenseOutOfBand(id string) {
 	h.licenses[id].Status = "suspended"
 }
 
+// linkPositionOutOfBand links a licence to a contract position as staff do in
+// the portal (the unbilled reason is dropped).
+func (h *fakeHub) linkPositionOutOfBand(id, positionID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	l := h.licenses[id]
+	p := h.positions[positionID]
+	contract := p.ContractID
+	old := l.ContractPositionID
+	l.ContractPositionID, l.ContractID, l.Unbilled = &positionID, &contract, nil
+	l.ValidUntil = p.EndDate
+	l.Revision++
+	h.linkPositionLocked(l, old)
+}
+
 // rotateKeyOutOfBand rotates the licence key as an admin or the customer in
 // the portal would; the new key never reaches Terraform.
 func (h *fakeHub) rotateKeyOutOfBand(id string) {
@@ -716,6 +731,12 @@ func (h *fakeHub) createLicense(w http.ResponseWriter, r *http.Request) {
 		(&fakeHTTPError{status: http.StatusNotFound, code: "environment_not_found", message: "Umgebung nicht gefunden"}).write(w)
 		return
 	}
+	for _, other := range h.licenses {
+		if other.EnvironmentID == env.EnvironmentID && other.Product == body.Product && other.Status == "suspended" {
+			(&fakeHTTPError{status: http.StatusConflict, code: "license_suspended", message: "In der Umgebung ist eine Lizenz dieses Produkts gesperrt"}).write(w)
+			return
+		}
+	}
 	h.nextID++
 	now := nowISO()
 	l := &fakeLicense{
@@ -962,6 +983,10 @@ func (h *fakeHub) endLicense(w http.ResponseWriter, r *http.Request) {
 	l, ok := h.licenses[r.PathValue("id")]
 	if !ok {
 		(&fakeHTTPError{status: http.StatusNotFound, code: "license_not_found", message: "Lizenz nicht gefunden"}).write(w)
+		return
+	}
+	if l.Status == "suspended" {
+		(&fakeHTTPError{status: http.StatusConflict, code: "license_suspended", message: "Die Lizenz ist gesperrt"}).write(w)
 		return
 	}
 	h.endLicenseLocked(l, "apikey:test")

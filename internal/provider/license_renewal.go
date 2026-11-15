@@ -134,3 +134,42 @@ func planTrialEnd(resp *resource.ModifyPlanResponse, state licenseModel, end, re
 	resp.Diagnostics.AddAttributeWarning(path.Root("unbilled_max_until"), "Trial licence ends soon",
 		fmt.Sprintf("Trial licence %s ends on %s. Terraform does not renew trials: %s.", state.ID.ValueString(), end, action))
 }
+
+// planBillingLink keeps the AI Hub's billing link. Staff may link a licence
+// to a contract position in the portal after Terraform issued it, and
+// Terraform must not undo that: while the Hub has a position and the
+// configuration names none (it still says `unbilled_reason`), the plan keeps
+// the Hub's position (unbilled_reason as configured is ignored) and only warns. A configuration that names a different
+// position is taken over. The billing attributes are computed, so every
+// case sets them explicitly (state is nil for a create).
+func planBillingLink(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse, state *licenseModel) {
+	var cfgPosition, cfgReason types.String
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("contract_position_id"), &cfgPosition)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("unbilled_reason"), &cfgReason)...)
+	if resp.Diagnostics.HasError() || cfgPosition.IsUnknown() || cfgReason.IsUnknown() {
+		return // known after apply: nothing to compare
+	}
+	set := func(name string, v types.String) {
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root(name), v)...)
+	}
+	switch {
+	case !cfgPosition.IsNull():
+		// A position in the configuration: taken over (the same as the Hub's
+		// changes nothing).
+		set("contract_position_id", cfgPosition)
+		set("unbilled_reason", types.StringNull())
+		set("unbilled_max_until", types.StringNull())
+	case state != nil && !state.ContractPositionID.IsNull() && state.Status.ValueString() != licenseStatusEnded:
+		// unbilled_reason stays as configured (Terraform requires it); Read keeps
+		// it in state while the Hub's position wins, so nothing differs.
+		set("contract_position_id", state.ContractPositionID)
+		if !cfgReason.IsNull() {
+			resp.Diagnostics.AddAttributeWarning(path.Root("unbilled_reason"), "Billing is linked to a contract position in the AI Hub – Terraform leaves it unchanged",
+				fmt.Sprintf("Licence %s is linked to contract position %s in the AI Hub (set in the portal). unbilled_reason = %q in the configuration is ignored. "+
+					"Set contract_position_id = %q to match, or a different position to relink it.", state.ID.ValueString(), state.ContractPositionID.ValueString(),
+					cfgReason.ValueString(), state.ContractPositionID.ValueString()))
+		}
+	default:
+		set("contract_position_id", types.StringNull())
+	}
+}

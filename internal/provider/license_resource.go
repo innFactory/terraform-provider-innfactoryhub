@@ -198,14 +198,18 @@ func (r *licenseResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
 			},
 			"contract_position_id": schema.StringAttribute{
-				Optional:    true,
-				Description: "Contract position that bills the licence. Set either this or `unbilled_reason`.",
-				Validators:  []validator.String{hubRefID},
+				Optional: true,
+				Computed: true,
+				Description: "Contract position that bills the licence. Set either this or `unbilled_reason`. After the licence is issued, the billing link in the AI Hub " +
+					"wins: staff may link it to a contract position in the portal, and Terraform leaves that unchanged unless this sets a different position.",
+				Validators: []validator.String{hubRefID},
 			},
 			"unbilled_reason": schema.StringAttribute{
-				Optional:    true,
-				Description: "Why the licence is not billed: `trial`, `partner` or `internal`. Set either this or `contract_position_id`.",
-				Validators:  []validator.String{stringvalidator.OneOf(unbilledReasons...)},
+				Optional: true,
+				Computed: true,
+				Description: "Why the licence is not billed: `trial`, `partner` or `internal`. Set either this or `contract_position_id`. " +
+					"Ignored (with a warning) while the licence hangs on a contract position in the AI Hub.",
+				Validators: []validator.String{stringvalidator.OneOf(unbilledReasons...)},
 			},
 			"unbilled_max_until": schema.StringAttribute{
 				Optional:    true,
@@ -469,9 +473,14 @@ var licenseHints = map[string]string{
 	"air_gapped_staff_only":     airGapStaffOnlyHint,
 	"air_gapped_unsupported": "Air-gap operation exists only for ai-gateway licences (details.product is this licence's product). " +
 		"Remove air_gapped or set it to false.",
+	"license_suspended": suspendedHint,
 	"license_ended": "The licence was ended in the AI Hub. Terraform does not re-issue it on its own: change rotation_trigger to issue a new licence, " +
 		"or remove the resource from the configuration.",
 }
+
+// suspendedHint explains the AI Hub's 409 license_suspended on end or create.
+const suspendedHint = "The licence is suspended in the AI Hub (emergency stop) — Terraform cannot end or replace it, " +
+	"and cannot issue another one for this environment and product, until a staff member resumes it in the portal."
 
 // airGapStaffOnlyHint explains the AI Hub's 403 air_gapped_staff_only: only
 // staff switch air-gap operation on, never an API key — and the provider
@@ -618,11 +627,15 @@ func (m *licenseModel) applyRemote(ctx context.Context, diags *diag.Diagnostics,
 	// Also fills state written before air_gapped existed (null).
 	m.AirGapped = types.BoolValue(l.Params.AirGapped)
 	m.ContractPositionID = types.StringPointerValue(l.ContractPositionID)
-	m.UnbilledReason, m.UnbilledMaxUntil = types.StringNull(), types.StringNull()
 	if l.Unbilled != nil {
 		m.UnbilledReason = types.StringValue(l.Unbilled.Reason)
 		m.UnbilledMaxUntil = types.StringValue(l.Unbilled.MaxUntil)
+	} else if l.ContractPositionID == nil || m.UnbilledReason.IsNull() {
+		m.UnbilledReason, m.UnbilledMaxUntil = types.StringNull(), types.StringNull()
 	}
+	// else: staff linked the licence to a position in the portal. The reason
+	// the configuration still names stays in state (it is ignored, see
+	// planBillingLink), so the plan shows no difference.
 	m.Status = types.StringValue(l.Status)
 	m.ValidUntil = types.StringValue(l.ValidUntil)
 	m.setRenewal(l)
@@ -658,7 +671,7 @@ func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest
 	// one (e.g. issued by an earlier apply whose answer was lost) is never
 	// issued a second time; the operator adopts or ends it (SEC-014).
 	envID, product := plan.EnvironmentID.ValueString(), plan.Product.ValueString()
-	running, err := r.runningLicenses(ctx, envID, product)
+	running, suspended, err := r.runningLicenses(ctx, envID, product)
 	if err != nil {
 		failCreate(ctx, resp, "Create licence failed", fmt.Sprintf("Looking up the running licences of environment %s failed: %s",
 			envID, withHint(err, licenseHints)))
@@ -668,8 +681,8 @@ func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest
 		failCreate(ctx, resp, "Licence already running for this environment and product",
 			fmt.Sprintf("Environment %s already has a running %s licence: %s. Terraform issues at most one and never takes one over on its own, "+
 				"so a licence issued by an earlier apply (e.g. one whose answer was lost) is not issued twice. Adopt it with "+
-				"`terraform import <address> <license_id>` and change rotation_trigger to get its key into state, or end it in the portal, then apply again.",
-				envID, product, strings.Join(running, ", ")))
+				"`terraform import <address> <license_id>` and change rotation_trigger to get its key into state, or end it in the portal, then apply again.%s",
+				envID, product, strings.Join(running, ", "), suspendedNote(suspended)))
 		return
 	}
 
@@ -679,7 +692,7 @@ func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest
 	var existing []string
 	var env envelope[licenseCreateResponse]
 	retried, err := r.client.create(ctx, licensesPath, body, &env, func() {
-		if ids, lerr := r.runningLicenses(ctx, envID, product); lerr == nil {
+		if ids, _, lerr := r.runningLicenses(ctx, envID, product); lerr == nil {
 			existing = ids
 		} else {
 			tflog.Warn(ctx, "license_lookup_failed", map[string]any{"environment_id": envID, "error": lerr.Error()})
@@ -778,22 +791,34 @@ func (r *licenseResource) adopt(ctx context.Context, plan *licenseModel, id stri
 }
 
 // runningLicenses lists the licences of an environment and product that are
-// not ended.
-func (r *licenseResource) runningLicenses(ctx context.Context, envID, product string) ([]string, error) {
+// not ended, and which of them are suspended.
+func (r *licenseResource) runningLicenses(ctx context.Context, envID, product string) (ids, suspended []string, err error) {
 	var env envelope[struct {
 		Licenses []licenseDTO `json:"licenses"`
 	}]
 	if err := r.client.do(ctx, http.MethodGet, licensesPath, url.Values{"environment_id": {envID}}, nil, &env); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var ids []string
 	for _, l := range env.Data.Licenses {
 		if l.Product == product && l.Status != licenseStatusEnded {
 			ids = append(ids, l.LicenseID)
+			if l.Status == "suspended" {
+				suspended = append(suspended, l.LicenseID)
+			}
 		}
 	}
 	slices.Sort(ids)
-	return ids, nil
+	slices.Sort(suspended)
+	return ids, suspended, nil
+}
+
+// suspendedNote adds the emergency-stop explanation when a running licence
+// is suspended.
+func suspendedNote(suspended []string) string {
+	if len(suspended) == 0 {
+		return ""
+	}
+	return "\n\nSuspended in the AI Hub (emergency stop): " + strings.Join(suspended, ", ") + ". " + suspendedHint
 }
 
 func listOrNone(ids []string) string {
@@ -841,6 +866,7 @@ func (r *licenseResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	}
 	if req.State.Raw.IsNull() {
 		refuseAirGappedCreate(ctx, req, resp)
+		planBillingLink(ctx, req, resp, nil)
 		return
 	}
 	var state, plan licenseModel
@@ -849,6 +875,8 @@ func (r *licenseResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	planBillingLink(ctx, req, resp, &state)
+	resp.Diagnostics.Append(resp.Plan.Get(ctx, &plan)...)
 	rotate := !plan.RotationTrigger.Equal(state.RotationTrigger)
 	trigger := path.Root("rotation_trigger")
 

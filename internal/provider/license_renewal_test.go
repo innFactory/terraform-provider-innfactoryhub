@@ -277,7 +277,7 @@ func TestLicenseRenewalSuspendedWarns(t *testing.T) {
 				},
 				Check: resource.TestCheckResourceAttr(licAddr, "renewal_reason", "suspended"),
 			},
-			{PreConfig: func() { hub.resumeLicenseOutOfBand(id) }, Config: cfg, PlanOnly: true},
+			{PreConfig: func() { hub.resumeLicenseOutOfBand(id) }, Config: cfg},
 		},
 	})
 }
@@ -420,4 +420,121 @@ func TestLicenseRenewalPlanUnit(t *testing.T) {
 // regexpFlat matches s although Terraform wraps long error text.
 func regexpFlat(s string) *regexp.Regexp {
 	return regexp.MustCompile(strings.ReplaceAll(regexp.QuoteMeta(s), " ", `\s+`))
+}
+
+// Staff link a Terraform licence to a contract position in the portal:
+// Terraform keeps the Hub's link, warns, and relinks only when the
+// configuration names a different position.
+func TestLicenseBillingLinkSetInPortalIsKept(t *testing.T) {
+	hub := newLicenseHub(t)
+	hub.enableRenewal()
+	useFakeHubEnv(t)
+	unbilled := licenseConfig(hub, unbilledGateway("partner"))
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		CheckDestroy:             checkLicensesEnded(hub),
+		Steps: []resource.TestStep{
+			{Config: unbilled, Check: captureAttr(licAddr, "id", &id)},
+			{
+				// Linked in the portal; the configuration still says unbilled.
+				PreConfig: func() { hub.linkPositionOutOfBand(id, alphaPositionID); hub.resetCalls() },
+				Config:    unbilled,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(licAddr, "contract_position_id", alphaPositionID),
+					func(*terraform.State) error {
+						if w := hub.writeCalls(); len(w) != 0 {
+							return fmt.Errorf("Terraform wrote: %v", w)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				// Another position in the configuration is taken over.
+				Config: licenseConfig(hub, gatewayLicense().with(licenseAttrs{"contract_position_id": fmt.Sprintf("%q", alphaPosition2ID)})),
+				Check:  resource.TestCheckResourceAttr(licAddr, "contract_position_id", alphaPosition2ID),
+			},
+		},
+	})
+}
+
+// air_gapped unset: the Hub's value (here switched on in the portal) stays.
+func TestLicenseAirGappedUnsetKeepsHubValueWithBillingLink(t *testing.T) {
+	hub := newLicenseHub(t)
+	hub.enableRenewal()
+	useFakeHubEnv(t)
+	cfg := licenseConfig(hub, gatewayLicense())
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		CheckDestroy:             checkLicensesEnded(hub),
+		Steps: []resource.TestStep{
+			{Config: cfg, Check: captureAttr(licAddr, "id", &id)},
+			{
+				PreConfig: func() { hub.setAirGappedOutOfBand(id, true); hub.resetCalls() },
+				Config:    cfg,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+				Check: resource.TestCheckResourceAttr(licAddr, "air_gapped", "true"),
+			},
+		},
+	})
+}
+
+// The Hub refuses to end a suspended licence for an API key (409
+// license_suspended): Terraform says why and what to do.
+func TestLicenseSuspendedCannotBeReplaced(t *testing.T) {
+	hub := newLicenseHub(t)
+	useFakeHubEnv(t)
+	cfg := licenseConfig(hub, gatewayLicense())
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		CheckDestroy:             checkLicensesEnded(hub),
+		Steps: []resource.TestStep{
+			{Config: cfg, Check: captureAttr(licAddr, "id", &id)},
+			{
+				PreConfig:   func() { hub.suspendLicenseOutOfBand(id) },
+				Config:      licenseConfig(hub, gatewayLicense().with(licenseAttrs{"product": `"ai-prices"`, "contract_position_id": fmt.Sprintf("%q", alphaPricesPosID)})),
+				ExpectError: regexpFlat("suspended in the AI Hub (emergency stop)"),
+			},
+			{PreConfig: func() { hub.resumeLicenseOutOfBand(id) }, Config: cfg},
+		},
+	})
+}
+
+// A new licence for an environment and product whose licence is suspended is
+// refused with the same explanation.
+func TestLicenseCreateRefusedWhileSuspended(t *testing.T) {
+	hub := newLicenseHub(t)
+	useFakeHubEnv(t)
+	cfg := licenseConfig(hub, gatewayLicense())
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		CheckDestroy:             checkLicensesEnded(hub),
+		Steps: []resource.TestStep{
+			{Config: cfg, Check: captureAttr(licAddr, "id", &id)},
+			{
+				PreConfig: func() { hub.suspendLicenseOutOfBand(id) },
+				Config: cfg + `
+resource "innfactoryhub_license" "second" {
+  environment_id = "` + alphaEnvID + `"
+  product        = "ai-gateway"
+  domains        = ["gpt2.alpha.example"]
+  max_users      = 5
+  edition        = "all"
+  unbilled_reason = "partner"
+}
+`,
+				ExpectError: regexpFlat("emergency stop"),
+			},
+			{PreConfig: func() { hub.resumeLicenseOutOfBand(id) }, Config: cfg},
+		},
+	})
 }
