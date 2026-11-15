@@ -763,3 +763,47 @@ resource "innfactoryhub_license" "second" {
 		},
 	})
 }
+
+// A pinned unbilled_max_until that staff move in the portal stays while the
+// configuration is unchanged; a changed configuration wins.
+func TestLicensePortalChangeOfPinnedEndIsKept(t *testing.T) {
+	fixToday(t, "2026-11-15")
+	hub := newLicenseHub(t)
+	hub.enableRenewal()
+	useFakeHubEnv(t)
+	pinned := func(d string) string {
+		return licenseConfig(hub, unbilledGateway("partner").with(licenseAttrs{"unbilled_max_until": fmt.Sprintf("%q", d)}))
+	}
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		CheckDestroy:             checkLicensesEnded(hub),
+		Steps: []resource.TestStep{
+			{Config: pinned(day(50)), Check: captureAttr(licAddr, "id", &id)},
+			{
+				PreConfig: func() { hub.setUnbilledEndOutOfBand(id, day(100), "active"); hub.resetCalls() },
+				Config:    pinned(day(50)),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+				Check: func(*terraform.State) error {
+					if w := hub.writeCalls(); len(w) != 0 {
+						return fmt.Errorf("Terraform wrote: %v", w)
+					}
+					if l, _ := hub.license(id); l.Unbilled.MaxUntil != day(100) {
+						return fmt.Errorf("the portal's end was turned back: %+v", l.Unbilled)
+					}
+					return nil
+				},
+			},
+			{
+				Config: pinned(day(60)),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(licAddr, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.TestCheckResourceAttr(licAddr, "unbilled_max_until", day(60)),
+			},
+			{Config: pinned(day(60)), ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}}},
+		},
+	})
+}

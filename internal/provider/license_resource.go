@@ -864,9 +864,15 @@ func (r *licenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 	if hub.Unbilled != nil {
 		hubReason = &hub.Unbilled.Reason
 	}
-	_, hasLast := lastBillingConfig(ctx, req.Private)
+	last, hasLast := lastBillingConfig(ctx, req.Private)
 	applied := billingConfig{Position: stringPtr(state.ContractPositionID), Reason: stringPtr(state.UnbilledReason), MaxUntil: stringPtr(state.UnbilledMaxUntil)}
 	diverged := hasLast && (!equalStrPtr(hub.ContractPositionID, applied.Position) || !equalStrPtr(hubReason, applied.Reason))
+	// A pinned end belongs to the billing link as well: staff may move it in
+	// the portal, and while the configuration is unchanged that stays. Unpinned,
+	// the end follows the Hub.
+	if hasLast && last.MaxUntil != nil && hub.Unbilled != nil && applied.MaxUntil != nil && hub.Unbilled.MaxUntil != *applied.MaxUntil {
+		diverged = true
+	}
 	savedPos, savedReason, savedUntil := state.ContractPositionID, state.UnbilledReason, state.UnbilledMaxUntil
 	state.applyRemote(ctx, &resp.Diagnostics, hub)
 	hubText := ""
