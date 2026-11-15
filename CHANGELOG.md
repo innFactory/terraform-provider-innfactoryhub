@@ -14,6 +14,9 @@ Prepared for release; the tag `v0.2.0` is pushed manually after approval (GoRele
 
 **Added**
 
+- Licence renewal (innFactory AI Hub, Spec 003): `innfactoryhub_license` reads `managed_by`, `renewal_due` and `renewal_reason` (computed; null for an older Hub, which is no error). An unbilled licence the Hub reports as `expires_soon` or `expired` is renewed by the plan as an in-place update of `unbilled_max_until` to the longest term of its reason (trial 60 days, partner/internal 12 months from today), key unchanged. New `auto_renew_unbilled` (default `true`); `false` makes the plan fail with what to do, a pinned `unbilled_max_until` only warns. A licence on a contract position is never changed; `suspended` (emergency stop in the portal) only warns. A fresh trial (30 days) is therefore extended to 60 days by the next apply.
+- `innfactoryhub_environment` docs: an unknown `companygpt_handle` creates a placeholder customer in the Hub (AI Hub Spec 003).
+
 - CompanyGPT handle (innFactory AI Hub): the CompanyGPT deployment name of a customer, e.g. `innfactory`, `lmu`, `ksob` — unique per customer in the Hub. Recommended over cloud identifiers to find the customer in CompanyGPT rollouts.
   - Data source `innfactoryhub_tenant`: new input `companygpt_handle` (`GET /api/v1/admin/tenants/lookup?companygpt_handle=…`), one of the mutually exclusive inputs; new computed `companygpt_handles` (list, empty — never null — when the tenant has none or the Hub does not know handles, e.g. innfactoryHUB).
   - Resource `innfactoryhub_environment`: `companygpt_handle` is one of the "exactly one of" customer bindings (sent as `lookup: {companygpt_handle: …}`); changing it, or switching to or from it, forces a new environment. Import restores it from the Hub's `identifier_used` (`type: companygpt_handle`).

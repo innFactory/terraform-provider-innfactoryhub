@@ -78,6 +78,10 @@ type licenseModel struct {
 	TenantID           types.String `tfsdk:"tenant_id"`
 	Status             types.String `tfsdk:"status"`
 	ValidUntil         types.String `tfsdk:"valid_until"`
+	AutoRenewUnbilled  types.Bool   `tfsdk:"auto_renew_unbilled"`
+	ManagedBy          types.String `tfsdk:"managed_by"`
+	RenewalDue         types.Bool   `tfsdk:"renewal_due"`
+	RenewalReason      types.String `tfsdk:"renewal_reason"`
 }
 
 const licenseStatusEnded = "ended"
@@ -213,6 +217,16 @@ func (r *licenseResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				},
 				PlanModifiers: []planmodifier.String{useStateUnlessChanged("unbilled_reason")},
 			},
+			"auto_renew_unbilled": schema.BoolAttribute{
+				Optional: true,
+				Computed: true,
+				Default:  booldefault.StaticBool(true),
+				Description: "Only for licences with `unbilled_reason`. `true` (default): when the AI Hub reports that the licence is about to expire " +
+					"(30 days) or has expired (`renewal_reason`), the plan moves `unbilled_max_until` to the longest term of the reason " +
+					"(trial 60 days, partner and internal 12 months from today) and the apply renews it in place — no new key. `false`: " +
+					"Terraform never renews, the plan fails with what to do. A licence on a contract position is never changed: it follows the contract. " +
+					"Has no effect when `unbilled_max_until` is set in the configuration — raise that date yourself.",
+			},
 			"rotation_trigger": schema.StringAttribute{
 				Optional: true,
 				Description: "Rotates the licence key: any change (including setting or removing it) rotates the key of the same licence in place " +
@@ -251,6 +265,20 @@ func (r *licenseResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			"valid_until": schema.StringAttribute{
 				Computed:    true,
 				Description: "Last day the licence is valid (`YYYY-MM-DD`).",
+			},
+			"managed_by": schema.StringAttribute{
+				Computed: true,
+				Description: "Who manages the licence in the AI Hub: `terraform` (issued with an API key — the portal only suspends it) or `portal`. " +
+					"Null for an AI Hub that does not report it.",
+			},
+			"renewal_due": schema.BoolAttribute{
+				Computed:    true,
+				Description: "The AI Hub's verdict that the licence needs attention (see `renewal_reason`). Null for an AI Hub that does not report it.",
+			},
+			"renewal_reason": schema.StringAttribute{
+				Computed: true,
+				Description: "Why the AI Hub wants the licence renewed: `expires_soon` (unbilled, ends within 30 days), `expired`, `ended`, `suspended` " +
+					"or `key_revoked`; null if nothing is due or the AI Hub does not report it. See `auto_renew_unbilled`.",
 			},
 		},
 	}
@@ -356,6 +384,15 @@ type licenseDTO struct {
 	Params             licenseParamsDTO `json:"params"`
 	ValidUntil         string           `json:"valid_until"`
 	Status             string           `json:"status"`
+	// ManagedBy and Renewal come with AI Hub Spec 003; older Hubs omit them.
+	ManagedBy *string         `json:"managed_by"`
+	Renewal   *licenseRenewal `json:"renewal"`
+}
+
+// licenseRenewal is `renewal` of a licence response.
+type licenseRenewal struct {
+	Due    bool    `json:"due"`
+	Reason *string `json:"reason"`
 }
 
 // licenseKeyInfo is LicenseKeyInfo without the fields the provider ignores.
@@ -549,6 +586,7 @@ func (m *licenseModel) fillComputed(ctx context.Context, diags *diag.Diagnostics
 	m.TenantID = types.StringValue(l.TenantID)
 	m.Status = types.StringValue(l.Status)
 	m.ValidUntil = types.StringValue(l.ValidUntil)
+	m.setRenewal(l)
 	if m.Features.IsUnknown() {
 		m.Features = strSet(ctx, diags, l.Params.Features)
 	}
@@ -587,6 +625,22 @@ func (m *licenseModel) applyRemote(ctx context.Context, diags *diag.Diagnostics,
 	}
 	m.Status = types.StringValue(l.Status)
 	m.ValidUntil = types.StringValue(l.ValidUntil)
+	m.setRenewal(l)
+	// State written before the attribute existed, and import: the default.
+	if m.AutoRenewUnbilled.IsNull() || m.AutoRenewUnbilled.IsUnknown() {
+		m.AutoRenewUnbilled = types.BoolValue(true)
+	}
+}
+
+// setRenewal copies managed_by and the renewal verdict; an AI Hub that does
+// not report them leaves them null.
+func (m *licenseModel) setRenewal(l licenseDTO) {
+	m.ManagedBy = types.StringPointerValue(l.ManagedBy)
+	m.RenewalDue, m.RenewalReason = types.BoolNull(), types.StringNull()
+	if l.Renewal != nil {
+		m.RenewalDue = types.BoolValue(l.Renewal.Due)
+		m.RenewalReason = types.StringPointerValue(l.Renewal.Reason)
+	}
 }
 
 func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -820,6 +874,8 @@ func (r *licenseResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		// No rotation: the key stays as it is, including "no key" after import.
 		planKey(ctx, resp, state.LicenseKey, state.KeyID, state.KeyStatus)
 	}
+
+	r.planRenewal(ctx, req, resp, state, plan)
 
 	// Switching air-gap operation off is a reduction in the Hub: it revokes
 	// the licence files issued before. Only a configured false does it (an

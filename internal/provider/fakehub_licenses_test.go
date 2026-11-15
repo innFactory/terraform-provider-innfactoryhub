@@ -85,6 +85,63 @@ type fakeLicense struct {
 	UpdatedBy          string            `json:"updated_by"`
 	EndedAt            *string           `json:"ended_at"`
 	EndedBy            *string           `json:"ended_by"`
+	// aware makes the licence report managed_by and renewal, like one from a
+	// Hub from Spec 003; without, it reads like one from an older Hub.
+	aware bool
+	// renewalReason overrides the derived reason (a verdict the fake does not
+	// model, e.g. one for a licence on a contract position).
+	renewalReason string
+}
+
+// fakeRenewal is the licence's `renewal`: the Hub's verdict on whether the
+// licence needs renewing (Spec 003 §5.3).
+type fakeRenewal struct {
+	Due        bool    `json:"due"`
+	Reason     *string `json:"reason"`
+	ValidUntil string  `json:"valid_until"`
+}
+
+// fakeRenewalWindowDays is RENEWAL_WINDOW_DAYS.
+const fakeRenewalWindowDays = 30
+
+func (l fakeLicense) renewal() fakeRenewal {
+	var reason string
+	switch {
+	case l.renewalReason != "":
+		reason = l.renewalReason
+	case l.Status == "ended":
+		reason = "ended"
+	case l.Status == "suspended":
+		reason = "suspended"
+	case l.Status == "expired":
+		reason = "expired"
+	case l.Unbilled != nil:
+		if at, err := time.Parse(isoDay, l.ValidUntil); err == nil && !at.After(fakeToday().AddDate(0, 0, fakeRenewalWindowDays)) {
+			reason = "expires_soon"
+		}
+	}
+	r := fakeRenewal{ValidUntil: l.ValidUntil}
+	if reason != "" {
+		r.Due, r.Reason = true, &reason
+	}
+	return r
+}
+
+// MarshalJSON adds the derived managed_by and renewal if the licence is aware.
+func (l fakeLicense) MarshalJSON() ([]byte, error) {
+	type plain fakeLicense
+	if !l.aware {
+		return json.Marshal(plain(l))
+	}
+	managedBy := "portal"
+	if l.CreatedBySource == "terraform" {
+		managedBy = "terraform"
+	}
+	return json.Marshal(struct {
+		plain
+		ManagedBy string      `json:"managed_by"`
+		Renewal   fakeRenewal `json:"renewal"`
+	}{plain(l), managedBy, l.renewal()})
 }
 
 // fakeLicenseKey is a LicenseKeyInfo plus what only the fake knows.
@@ -256,6 +313,38 @@ func (h *fakeHub) setAirGappedOutOfBand(id string, on bool) {
 	l := h.licenses[id]
 	l.Params.AirGapped = on
 	l.Revision++
+}
+
+// enableRenewal makes the fake an AI Hub from Spec 003: licences issued from
+// now on report managed_by and renewal.
+func (h *fakeHub) enableRenewal() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.renewalAware = true
+}
+
+// forceRenewalReason makes the Hub report a renewal reason for the licence.
+func (h *fakeHub) forceRenewalReason(id, reason string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.licenses[id].renewalReason = reason
+}
+
+// resumeLicenseOutOfBand resumes a suspended licence as an admin would.
+func (h *fakeHub) resumeLicenseOutOfBand(id string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.licenses[id].Status = "active"
+}
+
+// setUnbilledEndOutOfBand moves the end of an unbilled licence as time
+// passing would (the fake has no clock): a date in the past with status
+// expired is what the nightly job leaves behind.
+func (h *fakeHub) setUnbilledEndOutOfBand(id, maxUntil string, status string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	l := h.licenses[id]
+	l.Unbilled.MaxUntil, l.ValidUntil, l.Status = maxUntil, maxUntil, status
 }
 
 // activeKeyIDs lists the unrevoked key ids of a licence.
@@ -632,7 +721,7 @@ func (h *fakeHub) createLicense(w http.ResponseWriter, r *http.Request) {
 	l := &fakeLicense{
 		LicenseID: fmt.Sprintf("lic_%012d", h.nextID), TenantID: env.TenantID, EnvironmentID: env.EnvironmentID,
 		Product: body.Product, ValidFrom: fakeToday().Format(isoDay), Status: "active", Revision: 1,
-		CreatedBySource: "terraform", CreatedAt: now, CreatedBy: "apikey:test", UpdatedAt: now, UpdatedBy: "apikey:test",
+		CreatedBySource: "terraform", aware: h.renewalAware, CreatedAt: now, CreatedBy: "apikey:test", UpdatedAt: now, UpdatedBy: "apikey:test",
 	}
 	if herr := h.applyBillingLocked(l, body); herr != nil {
 		herr.write(w)
@@ -775,6 +864,10 @@ func (h *fakeHub) patchLicense(w http.ResponseWriter, r *http.Request) {
 			herr.write(w)
 			return
 		}
+	}
+	// A new end from today on revives an expired licence.
+	if next.Status == "expired" && next.ValidUntil >= fakeToday().Format(isoDay) {
+		next.Status = "active"
 	}
 	if herr := fakeAirGapStaffOnly(cur.Params.AirGapped, next.Params.AirGapped); herr != nil {
 		herr.write(w)
