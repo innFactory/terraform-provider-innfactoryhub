@@ -116,8 +116,13 @@ func (l fakeLicense) renewal() fakeRenewal {
 	case l.Status == "expired":
 		reason = "expired"
 	case l.Unbilled != nil:
-		if at, err := time.Parse(isoDay, l.ValidUntil); err == nil && !at.After(fakeToday().AddDate(0, 0, fakeRenewalWindowDays)) {
-			reason = "expires_soon"
+		if at, err := time.Parse(isoDay, l.ValidUntil); err == nil {
+			switch {
+			case at.Before(fakeToday()):
+				reason = "expired"
+			case !at.After(fakeToday().AddDate(0, 0, fakeRenewalWindowDays)):
+				reason = "expires_soon"
+			}
 		}
 	}
 	r := fakeRenewal{ValidUntil: l.ValidUntil}
@@ -536,7 +541,25 @@ func fakeResolveFeatures(product, editionID string, requested []string) ([]strin
 		message: fmt.Sprintf("Edition %s gibt es für dieses Produkt nicht", editionID), details: map[string]any{"available": available}}
 }
 
-func fakeToday() time.Time { return time.Now().UTC().Truncate(24 * time.Hour) }
+// fakeNow is the fake Hub's clock; fixToday replaces it.
+var fakeNow = time.Now
+
+func fakeToday() time.Time { return fakeNow().UTC().Truncate(24 * time.Hour) }
+
+// fixToday fixes the day of the fake Hub and of the provider's renewals
+// (renewalClock) for one test, so that expectations do not depend on the real
+// date (e.g. 2028-02-29 for the month clamping).
+func fixToday(t *testing.T, date string) {
+	t.Helper()
+	d, err := time.Parse(isoDay, date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origNow, origClock := fakeNow, renewalClock
+	fakeNow = func() time.Time { return d }
+	renewalClock = func() time.Time { return d }
+	t.Cleanup(func() { fakeNow, renewalClock = origNow, origClock })
+}
 
 const isoDay = "2006-01-02"
 
@@ -549,7 +572,7 @@ func fakeUnbilledLink(in fakeUnbilledInput) (*fakeUnbilled, *fakeHTTPError) {
 	case "trial":
 		def, limit = today.AddDate(0, 0, 30), today.AddDate(0, 0, 60)
 	case "partner", "internal":
-		def, limit = today.AddDate(0, 12, 0), today.AddDate(0, 12, 0)
+		def, limit = addMonthsClamped(today, 12), addMonthsClamped(today, 12)
 	default:
 		return nil, badRequest("unbilled.reason: trial | partner | internal")
 	}

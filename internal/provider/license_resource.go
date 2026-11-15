@@ -226,9 +226,8 @@ func (r *licenseResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				Computed: true,
 				Default:  booldefault.StaticBool(true),
 				Description: "Only for licences with `unbilled_reason`. `true` (default): when the AI Hub reports that the licence is about to expire " +
-					"(30 days) or has expired (`renewal_reason`), the plan moves `unbilled_max_until` to the longest term of the reason " +
-					"(trial 60 days, partner and internal 12 months from today) and the apply renews it in place — no new key. `false`: " +
-					"Terraform never renews, the plan fails with what to do. A licence on a contract position is never changed: it follows the contract. " +
+					"(14 days) or has expired (`renewal_reason`), the plan renews a `partner` or `internal` licence to 12 months from the day of the apply, in place — no new key. " +
+					"Trials are never renewed. `false`: Terraform never renews; an ending licence only warns, an expired one fails the plan with what to do. A licence on a contract position is never changed: it follows the contract. " +
 					"Has no effect when `unbilled_max_until` is set in the configuration — raise that date yourself.",
 			},
 			"rotation_trigger": schema.StringAttribute{
@@ -281,7 +280,7 @@ func (r *licenseResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			},
 			"renewal_reason": schema.StringAttribute{
 				Computed: true,
-				Description: "Why the AI Hub wants the licence renewed: `expires_soon` (unbilled, ends within 30 days), `expired`, `ended`, `suspended` " +
+				Description: "Why the AI Hub wants the licence renewed: `expires_soon` (unbilled, ends within 14 days at the moment), `expired`, `ended`, `suspended` " +
 					"or `key_revoked`; null if nothing is due or the AI Hub does not report it. See `auto_renew_unbilled`.",
 			},
 		},
@@ -706,6 +705,9 @@ func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest
 			return
 		}
 		r.adopt(ctx, &plan, id, resp)
+		if !resp.Diagnostics.HasError() {
+			rememberBillingConfig(ctx, req.Config, resp.Private, &resp.Diagnostics)
+		}
 		return
 	}
 	if err != nil {
@@ -729,6 +731,7 @@ func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest
 
 	plan.fillComputed(ctx, &resp.Diagnostics, env.Data.License)
 	plan.setKey(env.Data.LicenseKey, licenseKeyID(env.Data.LicenseKey))
+	rememberBillingConfig(ctx, req.Config, resp.Private, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
@@ -851,7 +854,34 @@ func (r *licenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 	// An ended licence stays in state with status "ended" — dropping it would
 	// re-issue it on the next apply and undo the Hub's decision (SEC-006).
 	// ModifyPlan refuses to plan it until rotation_trigger changes.
-	state.applyRemote(ctx, &resp.Diagnostics, env.Data.License)
+	//
+	// Billing link: with private state, a link that staff changed in the portal
+	// (a position, another reason) is not copied into state — state keeps what
+	// Terraform applied, so an unchanged configuration plans nothing. The
+	// Hub's link goes to private state for the plan's warning.
+	hub := env.Data.License
+	var hubReason *string
+	if hub.Unbilled != nil {
+		hubReason = &hub.Unbilled.Reason
+	}
+	_, hasLast := lastBillingConfig(ctx, req.Private)
+	applied := billingConfig{Position: stringPtr(state.ContractPositionID), Reason: stringPtr(state.UnbilledReason), MaxUntil: stringPtr(state.UnbilledMaxUntil)}
+	diverged := hasLast && (!equalStrPtr(hub.ContractPositionID, applied.Position) || !equalStrPtr(hubReason, applied.Reason))
+	savedPos, savedReason, savedUntil := state.ContractPositionID, state.UnbilledReason, state.UnbilledMaxUntil
+	state.applyRemote(ctx, &resp.Diagnostics, hub)
+	hubText := ""
+	if diverged {
+		var hubUntil *string
+		if hub.Unbilled != nil {
+			hubUntil = &hub.Unbilled.MaxUntil
+		}
+		hubText = describeLink(hub.ContractPositionID, hubReason, hubUntil)
+		state.ContractPositionID, state.UnbilledReason, state.UnbilledMaxUntil = savedPos, savedReason, savedUntil
+		logHubBillingDiff(ctx, hub.LicenseID, hubText)
+	}
+	if hasLast {
+		recordHubBillingDiff(ctx, resp.Private, hubText, &resp.Diagnostics)
+	}
 	state.trackKey(env.Data.Keys)
 	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
 }
@@ -981,6 +1011,7 @@ func (r *licenseResource) Update(ctx context.Context, req resource.UpdateRequest
 	}
 	plan.fillComputed(ctx, &resp.Diagnostics, env.Data.License)
 	plan.LicenseKey, plan.KeyID, plan.KeyStatus = state.LicenseKey, state.KeyID, state.KeyStatus
+	rememberBillingConfig(ctx, req.Config, resp.Private, &resp.Diagnostics)
 
 	if !plan.RotationTrigger.Equal(state.RotationTrigger) {
 		var rot envelope[licenseKeyRotation]
@@ -1014,6 +1045,14 @@ func patchBody(ctx context.Context, diags *diag.Diagnostics, plan, state license
 	case unbilled != nil:
 		reasonChanged := !plan.UnbilledReason.Equal(state.UnbilledReason)
 		endChanged := unbilled.MaxUntil != "" && !plan.UnbilledMaxUntil.Equal(state.UnbilledMaxUntil)
+		// A renewal planned the end unknown (see planRenewal): count it now, on
+		// the day of the apply.
+		if !reasonChanged && unbilled.MaxUntil == "" && plan.UnbilledMaxUntil.IsUnknown() && !state.UnbilledReason.IsNull() && state.ContractPositionID.IsNull() {
+			if limit, ok := unbilledLimit(unbilled.Reason, renewalClock()); ok && unbilled.Reason != "trial" {
+				unbilled.MaxUntil = limit.Format(isoDateLayout)
+				endChanged = true
+			}
+		}
 		if reasonChanged || endChanged {
 			body.Unbilled = unbilled
 		}

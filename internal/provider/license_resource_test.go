@@ -526,6 +526,7 @@ func sortedLists(body map[string]any) map[string]any {
 func TestLicenseUpdateInPlace(t *testing.T) {
 	trial := gatewayLicense().with(licenseAttrs{"contract_position_id": "", "unbilled_reason": `"trial"`})
 	inSixWeeks := fakeToday().AddDate(0, 0, 42).Format(isoDay)
+	inFourMonths := fakeToday().AddDate(0, 4, 0).Format(isoDay)
 	cases := []struct {
 		name  string
 		from  licenseAttrs
@@ -580,8 +581,15 @@ func TestLicenseUpdateInPlace(t *testing.T) {
 			patch: map[string]any{"contract_position_id": alphaPosition2ID},
 			check: resource.TestCheckResourceAttr(licAddr, "valid_until", position2EndDate),
 		},
-		// "billed becomes unbilled" is no update any more: the Hub's contract
-		// position wins (TestLicenseBillingLinkSetInPortalIsKept).
+		{
+			name: "billed becomes partner", from: gatewayLicense(),
+			to:    gatewayLicense().with(licenseAttrs{"contract_position_id": "", "unbilled_reason": `"partner"`, "unbilled_max_until": fmt.Sprintf("%q", inFourMonths)}),
+			patch: map[string]any{"unbilled": map[string]any{"reason": "partner", "max_until": inFourMonths}},
+			check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckNoResourceAttr(licAddr, "contract_position_id"),
+				resource.TestCheckResourceAttr(licAddr, "valid_until", inFourMonths),
+			),
+		},
 		{
 			name: "trial extended", from: trial,
 			to:    trial.with(licenseAttrs{"unbilled_max_until": fmt.Sprintf("%q", inSixWeeks)}),

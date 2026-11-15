@@ -33,26 +33,28 @@ To take a licence away, **end or suspend it in the Hub** (portal). Terraform doe
 
 ### Billing link and air-gap set in the portal
 
-Staff may link a Terraform licence to a **contract position** in the portal later, and switch `air_gapped`. Terraform does not undo that. After issue, the AI Hub's billing link wins: while the licence hangs on a position and the configuration still says `unbilled_reason`, the plan is empty apart from the warning `Billing is linked to a contract position in the AI Hub – Terraform leaves it unchanged`. A different `contract_position_id` in the configuration is taken over; `contract_position_id` equal to the Hub's changes nothing. `air_gapped` unset keeps the Hub's value (never sent). Because the position can change in the Hub, `contract_position_id` and `unbilled_reason` are also computed.
+Staff may change the **billing link** of a Terraform licence in the portal later (link a contract position, set another unbilled reason) and switch `air_gapped`. Terraform does not undo that. The provider remembers the billing configuration it applied last (private state): **as long as the configuration is unchanged, the Hub's link stays** — state keeps what Terraform applied, the plan is empty and shows the warning `Billing in the AI Hub differs from the configuration – Terraform leaves it unchanged`, and nothing is written. A **changed** billing configuration wins and is applied (also from a position Terraform set itself to `unbilled_reason`, and the other way round). A different `contract_position_id` is always taken over. Because the link can differ from the configuration, `contract_position_id` and `unbilled_reason` are also computed. `air_gapped` unset keeps the Hub's value (never sent).
+
+State written by an earlier provider version (or an import) has no remembered configuration; there the simpler rule applies: while the Hub has a position and the configuration names none (`unbilled_reason`), the Hub's position stays and the plan warns `Billing is linked to a contract position in the AI Hub – Terraform leaves it unchanged`. The next apply stores the configuration. A **replacement** (new `environment_id`/`product`, `rotation_trigger` on an ended licence) issues the licence from the configuration and drops a link staff set in the portal. A pinned `unbilled_max_until` that staff extended in the portal is read back and turned back to the configuration only when you change it.
 
 ### Suspended licences
 
-A licence suspended in the Hub (emergency stop) cannot be ended or replaced by an API key: the Hub answers `409 license_suspended` to `DELETE` and to a new licence for the same environment and product. The provider passes this on as `suspended in the AI Hub (emergency stop) — Terraform cannot end or replace it … until a staff member resumes it in the portal`; resume it in the portal, then apply again.
+A licence suspended in the Hub (emergency stop) cannot be ended or replaced by an API key: the Hub answers `409 license_suspended` to `DELETE` and to a new licence for the same environment and product. The provider passes this on as `suspended in the AI Hub (emergency stop) — Terraform cannot end or replace it … until a staff member resumes it in the portal`; resume it in the portal, then apply again. A suspended licence can neither be replaced nor destroyed (`terraform destroy` fails the same way) until it is resumed.
 
 ### Renewing unbilled licences
 
-The portal no longer changes licences issued by Terraform (`managed_by = "terraform"`; it only suspends them in an emergency), so Terraform renews them. The Hub reports per licence whether one is due (`renewal_due`, `renewal_reason`); a Hub from before that (AI Hub Spec 003) reports nothing and the attributes stay null — nothing is planned then.
+The portal does not extend or renew licences issued by Terraform (`managed_by = "terraform"`; staff can suspend them in an emergency and change the billing link and `air_gapped`), so Terraform renews them. The Hub reports per licence whether one is due (`renewal_due`, `renewal_reason`); a Hub from before that (AI Hub Spec 003) reports nothing and the attributes stay null — nothing is planned then.
 
 | `renewal_reason` | What the plan does |
 |---|---|
-| `expires_soon` / `expired` on a `partner` or `internal` licence | With `auto_renew_unbilled = true` (default) and no `unbilled_max_until` in the configuration: plans an **in-place update** of `unbilled_max_until` to 12 months from today, warns `Renewing an unbilled licence`; the key stays, an expired licence becomes `active` again. With `auto_renew_unbilled = false`: fails with the options (enable it, set a later `unbilled_max_until`, or bill it through a contract position). With `unbilled_max_until` set in the configuration: only warns — the date is yours; raise it or remove it |
-| `expires_soon` on a `trial` licence | Never renewed (an endlessly renewed trial would be an invisible free licence). Warns `Trial licence ends soon`: bind it to a contract position (`contract_position_id`) or deliberately set `unbilled_max_until` |
-| `expired` on a `trial` licence | Plan error `Trial licence expired` with the same two ways out |
+| `expires_soon` / `expired` on a `partner` or `internal` licence | With `auto_renew_unbilled = true` (default) and no `unbilled_max_until` in the configuration: plans an **in-place update**; `unbilled_max_until` is *known after apply* — the date (12 months from the day of the **apply**, the warning `Renewing an unbilled licence` names the expected one) is counted when the update runs, so a saved plan stays valid across midnight. The key stays, an expired licence becomes `active` again. With `auto_renew_unbilled = false` or a pinned `unbilled_max_until`: `expires_soon` only warns, `expired` fails the plan with the ways out (enable it, set a later `unbilled_max_until`, or bill it through a contract position) |
+| `expires_soon` on a `trial` licence | Never renewed (an endlessly renewed trial would be an invisible free licence). Warns `Trial licence ends soon`: bind it to a contract position (`contract_position_id`), set `unbilled_max_until` deliberately (at most 60 days from today), or have staff link or extend it in the portal |
+| `expired` on a `trial` licence | Plan error `Trial licence expired` with the same ways out |
 | `expires_soon` / `expired` on a licence with `contract_position_id` | Nothing: the term follows the contract |
 | `suspended` | Warns `Licence suspended in the AI Hub – Terraform does not intervene` (emergency stop in the portal); never resumes |
 | `ended`, `key_revoked` | As above: change `rotation_trigger` |
 
-`expires_soon` is the Hub's verdict shortly before the end (14 days at the moment); the provider computes no window. A pinned end in that window warns on every plan.
+`expires_soon` is the Hub's verdict shortly before the end (14 days at the moment); the provider computes no window. **Terraform renews only when it plans and applies** inside that window, so run `plan`/`apply` regularly — at least weekly (e.g. a scheduled pipeline); a licence nobody plans for runs out. A pinned end in that window warns on every plan.
 
 ### Lost answers
 
@@ -89,7 +91,7 @@ variable "max_users" {
 variable "contract_position_id" {
   type        = string
   default     = null
-  description = "Contract position that bills the licence; null issues a trial."
+  description = "Contract position that bills the licence; null issues a partner licence."
 }
 
 resource "innfactoryhub_license" "ai_gateway" {
@@ -143,7 +145,7 @@ output "license_key" {
 - `air_gapped` (Boolean) Air-gap operation for an installation without internet access — only then does the Hub issue licence files. `ai-gateway` only. Only AI Hub staff switch it on, in the portal. **Unset**, Terraform leaves it as the Hub has it (a new licence starts with `false`) and only reads it. **`true`** keeps a value switched on in the portal; **`false`** switches it off in place. Also computed. See [Air-gapped installations](#air-gapped-installations).
 - `contract_position_id` (String) Contract position that bills the licence. Set **exactly one** of `contract_position_id` and `unbilled_reason` (checked at plan time).
 - `unbilled_reason` (String) Why the licence is not billed: `trial`, `partner` or `internal`.
-- `unbilled_max_until` (String) Last day (`YYYY-MM-DD`) of an unbilled licence; only together with `unbilled_reason`. Without it the Hub applies its default per reason — trial 30 days, partner and internal 12 months from the day of issue (limits: trial 60 days, partner and internal 12 months). The applied date is recorded here; re-applying the same reason does not extend it. A later date extends the licence. Also computed.
+- `unbilled_max_until` (String) Last day (`YYYY-MM-DD`) of an unbilled licence; only together with `unbilled_reason`. Without it the Hub applies its default per reason — trial 30 days (never renewed by Terraform), partner and internal 12 months from the day of issue (limits: trial 60 days, partner and internal 12 months). The applied date is recorded here; re-applying the same reason does not extend it. A later date extends the licence. Also computed.
 - `auto_renew_unbilled` (Boolean) Only for licences with `unbilled_reason`. `true` (default): renew them in place when the Hub reports `expires_soon` or `expired`, see [Renewing unbilled licences](#renewing-unbilled-licences). `false`: never renew, the plan fails instead. Ignored while `unbilled_max_until` is set.
 - `rotation_trigger` (String) Any change rotates the licence key in place; for a licence ended in the Hub it issues a new licence. See [Rotating the key](#rotating-the-key).
 
@@ -158,7 +160,7 @@ Plain identifiers (`environment_id`, `contract_position_id`) accept letters, dig
 - `tenant_id` (String) Hub customer of the environment.
 - `status` (String) `active`, `suspended`, `expired` or `ended`. Never changed by Terraform.
 - `valid_until` (String) Last day the licence is valid: the end of the contract position or contract, or `unbilled_max_until`.
-- `managed_by` (String) `terraform` (issued with an API key; the portal only suspends it) or `portal`. Null for an AI Hub that does not report it.
+- `managed_by` (String) `terraform` (issued with an API key; the portal does not extend or renew it) or `portal`. Null for an AI Hub that does not report it.
 - `renewal_due` (Boolean) The Hub's verdict that the licence needs attention. Null for an AI Hub that does not report it.
 - `renewal_reason` (String) `expires_soon`, `expired`, `ended`, `suspended` or `key_revoked`; null if nothing is due or the Hub does not report it.
 

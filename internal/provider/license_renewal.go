@@ -2,12 +2,15 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 )
 
 // Reasons of the AI Hub's `renewal.reason` the provider acts on.
@@ -47,12 +50,16 @@ var renewalClock = func() time.Time {
 }
 
 // planRenewal acts on the AI Hub's renewal verdict (Spec 003 §5.3), because
-// the portal no longer changes Terraform's licences. An unbilled licence that
-// expires soon or has expired gets a longer end planned (an in-place update:
-// same licence, same key); a licence suspended in the portal only warns —
-// that is an emergency stop Terraform must not undo. Trials are never renewed. A licence on a contract
-// position follows its contract and is never touched. Ended licences and
-// revoked keys are handled through rotation_trigger (see ModifyPlan).
+// the portal no longer changes Terraform's licences. A partner or internal
+// licence that expires soon or has expired gets a longer end: the plan marks
+// unbilled_max_until unknown and Update computes the date at apply time, so a
+// saved plan stays valid across midnight. Trials are never renewed (warning
+// before the end, error after it). A licence suspended in the portal only
+// warns (emergency stop). A licence on a contract position follows its
+// contract and is never touched. Ended licences and revoked keys are handled
+// through rotation_trigger (see ModifyPlan). Renewal happens only when
+// Terraform plans and applies inside the Hub's renewal window (14 days), so
+// plan and apply at least weekly.
 func (r *licenseResource) planRenewal(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse, state, plan licenseModel) {
 	reason := state.RenewalReason.ValueString()
 	if reason == renewalSuspended && state.Status.ValueString() == "suspended" {
@@ -72,12 +79,20 @@ func (r *licenseResource) planRenewal(ctx context.Context, req resource.ModifyPl
 	if !ok || !plan.UnbilledReason.Equal(state.UnbilledReason) {
 		return // billing link being changed by the configuration itself
 	}
-	current := state.UnbilledMaxUntil.ValueString()
+	current := state.ValidUntil.ValueString()
+	if current == "" {
+		current = state.UnbilledMaxUntil.ValueString()
+	}
 	if !plan.UnbilledMaxUntil.IsUnknown() && !plan.UnbilledMaxUntil.Equal(state.UnbilledMaxUntil) {
 		return // the configuration already sets a new end
 	}
+	expired := reason == renewalExpired
+	what := "ends on " + current
+	if expired {
+		what = "expired on " + current
+	}
 	if unbilledReason == "trial" {
-		planTrialEnd(resp, state, current, reason)
+		planTrialEnd(resp, state, what, expired)
 		return
 	}
 	limit, ok := unbilledLimit(unbilledReason, renewalClock())
@@ -89,27 +104,34 @@ func (r *licenseResource) planRenewal(ctx context.Context, req resource.ModifyPl
 		return // already at the longest term: nothing a renewal could add
 	}
 
-	what := "expires on " + current
-	if reason == renewalExpired {
-		what = "expired on " + current
-	}
 	var configured types.String
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("unbilled_max_until"), &configured)...)
+	if configured.IsUnknown() {
+		return
+	}
+	// The ways out are the same wherever Terraform does not renew.
+	options := fmt.Sprintf("set unbilled_max_until to a later date (at most %s for %s), or put the licence on a contract position (contract_position_id)", next, unbilledReason)
 	switch {
 	case !configured.IsNull():
-		// A date the operator pinned is theirs: a short trial may be
-		// intended, so this only warns.
-		resp.Diagnostics.AddAttributeWarning(path.Root("unbilled_max_until"), "Unbilled licence ends soon",
-			fmt.Sprintf("Licence %s %s (%s) and unbilled_max_until is set to %s in the configuration, so Terraform does not renew it. "+
-				"Set a later unbilled_max_until (at most %s for %s), or remove the attribute to let Terraform renew it.",
-				state.ID.ValueString(), what, unbilledReason, configured.ValueString(), next, unbilledReason))
+		// A date the operator pinned is theirs.
+		summary := "Unbilled licence ends soon"
+		if expired {
+			summary = "Unbilled licence expired"
+		}
+		diagnose(resp, expired, path.Root("unbilled_max_until"), summary,
+			fmt.Sprintf("Licence %s %s (%s) and unbilled_max_until is pinned to %s in the configuration, so Terraform does not renew it. "+
+				"Remove the attribute to let Terraform renew it, or %s.", state.ID.ValueString(), what, unbilledReason, configured.ValueString(), options))
 	case !plan.AutoRenewUnbilled.IsNull() && !plan.AutoRenewUnbilled.ValueBool():
-		resp.Diagnostics.AddAttributeError(path.Root("auto_renew_unbilled"), "Unbilled licence needs renewing",
-			fmt.Sprintf("Licence %s %s (%s) and auto_renew_unbilled is false. Set auto_renew_unbilled = true to let Terraform extend it to %s, "+
-				"set unbilled_max_until to a later date (at most %s), or put the licence on a contract position (contract_position_id).",
-				state.ID.ValueString(), what, unbilledReason, next, next))
+		summary := "Unbilled licence ends soon"
+		if expired {
+			summary = "Unbilled licence expired"
+		}
+		diagnose(resp, expired, path.Root("auto_renew_unbilled"), summary,
+			fmt.Sprintf("Licence %s %s (%s) and auto_renew_unbilled is false. Set auto_renew_unbilled = true to let Terraform extend it, or %s.",
+				state.ID.ValueString(), what, unbilledReason, options))
 	default:
-		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("unbilled_max_until"), types.StringValue(next))...)
+		// The date is computed in Update, at apply time.
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("unbilled_max_until"), types.StringUnknown())...)
 		// The framework marks Hub-computed values unknown for a change it
 		// sees in the configuration; this change is ours, so do it here.
 		for _, name := range []string{"status", "valid_until", "renewal_reason"} {
@@ -117,32 +139,147 @@ func (r *licenseResource) planRenewal(ctx context.Context, req resource.ModifyPl
 		}
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("renewal_due"), types.BoolUnknown())...)
 		resp.Diagnostics.AddAttributeWarning(path.Root("unbilled_max_until"), "Renewing an unbilled licence",
-			fmt.Sprintf("Licence %s %s (%s). This apply extends it to %s in place; the licence key stays. "+
+			fmt.Sprintf("Licence %s %s (%s). This apply extends it in place — expected %s, counted on the day of the apply; the licence key stays. "+
 				"Set auto_renew_unbilled = false to stop that, or contract_position_id to bill it.", state.ID.ValueString(), what, unbilledReason, next))
 	}
 }
 
-// planTrialEnd never renews a trial: one that is renewed over and over would
-// be a free licence nobody notices. It warns before the end and fails after.
-func planTrialEnd(resp *resource.ModifyPlanResponse, state licenseModel, end, reason string) {
-	const action = "bind it to a contract position (contract_position_id) or deliberately set unbilled_max_until"
-	if reason == renewalExpired {
-		resp.Diagnostics.AddAttributeError(path.Root("unbilled_max_until"), "Trial licence expired",
-			fmt.Sprintf("Trial licence %s expired on %s. Terraform does not renew trials: %s.", state.ID.ValueString(), end, action))
+// diagnose adds an error (expired) or a warning (ends soon).
+func diagnose(resp *resource.ModifyPlanResponse, isError bool, p path.Path, summary, detail string) {
+	if isError {
+		resp.Diagnostics.AddAttributeError(p, summary, detail)
 		return
 	}
-	resp.Diagnostics.AddAttributeWarning(path.Root("unbilled_max_until"), "Trial licence ends soon",
-		fmt.Sprintf("Trial licence %s ends on %s. Terraform does not renew trials: %s.", state.ID.ValueString(), end, action))
+	resp.Diagnostics.AddAttributeWarning(p, summary, detail)
 }
 
-// planBillingLink keeps the AI Hub's billing link. Staff may link a licence
-// to a contract position in the portal after Terraform issued it, and
-// Terraform must not undo that: while the Hub has a position and the
-// configuration names none (it still says `unbilled_reason`), the plan keeps
-// the Hub's position (unbilled_reason as configured is ignored) and only warns. A configuration that names a different
-// position is taken over. The billing attributes are computed, so every
-// case sets them explicitly (state is nil for a create).
+// planTrialEnd never renews a trial: one that is renewed over and over would
+// be a free licence nobody notices. It warns before the end and fails after.
+func planTrialEnd(resp *resource.ModifyPlanResponse, state licenseModel, what string, expired bool) {
+	limit, _ := unbilledLimit("trial", renewalClock())
+	action := fmt.Sprintf("bind it to a contract position (contract_position_id), or set unbilled_max_until deliberately (at most %s, 60 days from today), "+
+		"or have staff link or extend it in the portal", limit.Format(isoDateLayout))
+	summary := "Trial licence ends soon"
+	if expired {
+		summary = "Trial licence expired"
+	}
+	diagnose(resp, expired, path.Root("unbilled_max_until"), summary,
+		fmt.Sprintf("Trial licence %s %s. Terraform does not renew trials: %s.", state.ID.ValueString(), what, action))
+}
+
+// billingConfig is the billing link as last configured (and applied) by
+// Terraform, kept in private state. It tells a change of the configuration
+// (which wins) from a change staff made in the portal (which Terraform
+// leaves alone). Nil values are unset attributes.
+type billingConfig struct {
+	Position *string `json:"position"`
+	Reason   *string `json:"reason"`
+	MaxUntil *string `json:"max_until"`
+}
+
+const (
+	privateBillingConfig = "billing_config" // billingConfig as last configured
+	privateHubBilling    = "hub_billing"    // text: the Hub's link, when it differs from state
+)
+
+type privateReader interface {
+	GetKey(ctx context.Context, key string) ([]byte, diag.Diagnostics)
+}
+
+type privateWriter interface {
+	SetKey(ctx context.Context, key string, value []byte) diag.Diagnostics
+}
+
+func stringPtr(v types.String) *string {
+	if v.IsNull() || v.IsUnknown() {
+		return nil
+	}
+	s := v.ValueString()
+	return &s
+}
+
+func equalStrPtr(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func (b billingConfig) equal(o billingConfig) bool {
+	return equalStrPtr(b.Position, o.Position) && equalStrPtr(b.Reason, o.Reason) && equalStrPtr(b.MaxUntil, o.MaxUntil)
+}
+
+// configuredBilling reads the billing attributes from a configuration.
+func configuredBilling(ctx context.Context, cfg interface {
+	GetAttribute(context.Context, path.Path, any) diag.Diagnostics
+}) (billingConfig, diag.Diagnostics) {
+	var pos, reason, until types.String
+	var diags diag.Diagnostics
+	diags.Append(cfg.GetAttribute(ctx, path.Root("contract_position_id"), &pos)...)
+	diags.Append(cfg.GetAttribute(ctx, path.Root("unbilled_reason"), &reason)...)
+	diags.Append(cfg.GetAttribute(ctx, path.Root("unbilled_max_until"), &until)...)
+	return billingConfig{Position: stringPtr(pos), Reason: stringPtr(reason), MaxUntil: stringPtr(until)}, diags
+}
+
+// rememberBillingConfig stores the configured billing link in private state
+// (Create and Update).
+func rememberBillingConfig(ctx context.Context, cfg interface {
+	GetAttribute(context.Context, path.Path, any) diag.Diagnostics
+}, priv privateWriter, diags *diag.Diagnostics) {
+	b, d := configuredBilling(ctx, cfg)
+	diags.Append(d...)
+	if d.HasError() {
+		return
+	}
+	raw, err := json.Marshal(b)
+	if err != nil {
+		return
+	}
+	diags.Append(priv.SetKey(ctx, privateBillingConfig, raw)...)
+}
+
+// lastBillingConfig reads what rememberBillingConfig stored; ok is false for
+// state from before it existed (or an import).
+func lastBillingConfig(ctx context.Context, priv privateReader) (b billingConfig, ok bool) {
+	raw, _ := priv.GetKey(ctx, privateBillingConfig)
+	if len(raw) == 0 || json.Unmarshal(raw, &b) != nil {
+		return billingConfig{}, false
+	}
+	return b, true
+}
+
+// describeLink is the billing link of a licence as text.
+func describeLink(position, reason, maxUntil *string) string {
+	switch {
+	case position != nil:
+		return "contract position " + *position
+	case reason != nil:
+		return "unbilled (" + *reason + ") until " + deref(maxUntil)
+	}
+	return "no billing link"
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return "-"
+	}
+	return *s
+}
+
+// planBillingLink keeps the AI Hub's billing link. Staff may change it in the
+// portal after Terraform issued the licence (link a position, set another
+// reason) and Terraform must not undo that: as long as the configuration is
+// the one Terraform applied last (private state), the Hub's link stays — Read
+// then keeps the applied link in state and records the Hub's in private
+// state, so the plan is empty and only warns about the difference. A
+// changed configuration wins. Without private state (state from before it
+// existed, or an import) the rule is simpler: while the Hub has a position
+// and the configuration names none, the Hub's position stays and the plan
+// warns. The billing attributes are computed, so every case sets them
+// explicitly (state is nil for a create).
 func planBillingLink(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse, state *licenseModel) {
+	cfg, d := configuredBilling(ctx, req.Config)
+	resp.Diagnostics.Append(d...)
 	var cfgPosition, cfgReason types.String
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("contract_position_id"), &cfgPosition)...)
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("unbilled_reason"), &cfgReason)...)
@@ -152,24 +289,68 @@ func planBillingLink(ctx context.Context, req resource.ModifyPlanRequest, resp *
 	set := func(name string, v types.String) {
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root(name), v)...)
 	}
+	var last billingConfig
+	var hasLast bool
+	if state != nil && req.Private != nil {
+		last, hasLast = lastBillingConfig(ctx, req.Private)
+	}
 	switch {
 	case !cfgPosition.IsNull():
-		// A position in the configuration: taken over (the same as the Hub's
-		// changes nothing).
+		// A position in the configuration is taken over (the Hub's own
+		// position changes nothing); an unchanged one that staff moved is kept
+		// by Read, so it is equal to state here.
 		set("contract_position_id", cfgPosition)
 		set("unbilled_reason", types.StringNull())
 		set("unbilled_max_until", types.StringNull())
-	case state != nil && !state.ContractPositionID.IsNull() && state.Status.ValueString() != licenseStatusEnded:
-		// unbilled_reason stays as configured (Terraform requires it); Read keeps
-		// it in state while the Hub's position wins, so nothing differs.
+	case state == nil || state.Status.ValueString() == licenseStatusEnded:
+		set("contract_position_id", types.StringNull())
+	case hasLast && last.equal(cfg):
+		// Configuration unchanged: whatever the state holds stays.
 		set("contract_position_id", state.ContractPositionID)
-		if !cfgReason.IsNull() {
-			resp.Diagnostics.AddAttributeWarning(path.Root("unbilled_reason"), "Billing is linked to a contract position in the AI Hub – Terraform leaves it unchanged",
-				fmt.Sprintf("Licence %s is linked to contract position %s in the AI Hub (set in the portal). unbilled_reason = %q in the configuration is ignored. "+
-					"Set contract_position_id = %q to match, or a different position to relink it.", state.ID.ValueString(), state.ContractPositionID.ValueString(),
-					cfgReason.ValueString(), state.ContractPositionID.ValueString()))
-		}
+	case hasLast:
+		// Configuration changed to unbilled: it wins over a position.
+		set("contract_position_id", types.StringNull())
+	case !state.ContractPositionID.IsNull():
+		// No private state: the Hub's position wins over a reason.
+		set("contract_position_id", state.ContractPositionID)
+		resp.Diagnostics.AddAttributeWarning(path.Root("unbilled_reason"), "Billing is linked to a contract position in the AI Hub – Terraform leaves it unchanged",
+			fmt.Sprintf("Licence %s is linked to contract position %s in the AI Hub (set in the portal). unbilled_reason = %q in the configuration is ignored. "+
+				"Set contract_position_id = %q to match, or a different position to relink it.", state.ID.ValueString(), state.ContractPositionID.ValueString(),
+				cfgReason.ValueString(), state.ContractPositionID.ValueString()))
 	default:
 		set("contract_position_id", types.StringNull())
 	}
+	// Differences between the Hub and what Terraform applied (set by Read).
+	if state != nil && req.Private != nil {
+		if hub := hubBillingDiff(ctx, req.Private); hub != "" {
+			resp.Diagnostics.AddWarning("Billing in the AI Hub differs from the configuration – Terraform leaves it unchanged",
+				fmt.Sprintf("Licence %s: the AI Hub has %s (changed in the portal); Terraform applied %s. It stays that way until you change the billing "+
+					"attributes in the configuration.", state.ID.ValueString(), hub,
+					describeLink(stringPtr(state.ContractPositionID), stringPtr(state.UnbilledReason), stringPtr(state.UnbilledMaxUntil))))
+		}
+	}
+}
+
+// logHubBillingDiff records, for the log only, a difference between the Hub's
+// billing link and the applied one.
+func logHubBillingDiff(ctx context.Context, id, hub string) {
+	tflog.Info(ctx, "license_billing_link_differs", map[string]any{"license_id": id, "hub": hub})
+}
+
+// hubBillingDiff reads what Read recorded: the Hub's billing link as text
+// when it differs from the applied one, else "".
+func hubBillingDiff(ctx context.Context, priv privateReader) string {
+	raw, _ := priv.GetKey(ctx, privateHubBilling)
+	var text string
+	if len(raw) == 0 || json.Unmarshal(raw, &text) != nil {
+		return ""
+	}
+	return text
+}
+
+// recordHubBillingDiff stores the Hub's link as text (JSON string), "" when
+// there is no difference.
+func recordHubBillingDiff(ctx context.Context, priv privateWriter, text string, diags *diag.Diagnostics) {
+	raw, _ := json.Marshal(text)
+	diags.Append(priv.SetKey(ctx, privateHubBilling, raw)...)
 }
