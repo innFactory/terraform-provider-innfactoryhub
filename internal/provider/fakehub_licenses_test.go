@@ -102,7 +102,7 @@ type fakeRenewal struct {
 }
 
 // fakeRenewalWindowDays is RENEWAL_WINDOW_DAYS.
-const fakeRenewalWindowDays = 30
+const fakeRenewalWindowDays = 14
 
 func (l fakeLicense) renewal() fakeRenewal {
 	var reason string

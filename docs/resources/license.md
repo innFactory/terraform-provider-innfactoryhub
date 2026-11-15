@@ -37,12 +37,14 @@ The portal no longer changes licences issued by Terraform (`managed_by = "terraf
 
 | `renewal_reason` | What the plan does |
 |---|---|
-| `expires_soon` / `expired` on a licence with `unbilled_reason` | With `auto_renew_unbilled = true` (default) and no `unbilled_max_until` in the configuration: plans an **in-place update** of `unbilled_max_until` to the longest term of the reason from today (trial 60 days, partner and internal 12 months), warns `Renewing an unbilled licence`; the key stays, an expired licence becomes `active` again. With `auto_renew_unbilled = false`: fails with the options (enable it, set a later `unbilled_max_until`, or bill it through a contract position). With `unbilled_max_until` set in the configuration: only warns — the date is yours; raise it or remove it |
+| `expires_soon` / `expired` on a `partner` or `internal` licence | With `auto_renew_unbilled = true` (default) and no `unbilled_max_until` in the configuration: plans an **in-place update** of `unbilled_max_until` to 12 months from today, warns `Renewing an unbilled licence`; the key stays, an expired licence becomes `active` again. With `auto_renew_unbilled = false`: fails with the options (enable it, set a later `unbilled_max_until`, or bill it through a contract position). With `unbilled_max_until` set in the configuration: only warns — the date is yours; raise it or remove it |
+| `expires_soon` on a `trial` licence | Never renewed (an endlessly renewed trial would be an invisible free licence). Warns `Trial licence ends soon`: bind it to a contract position (`contract_position_id`) or deliberately set `unbilled_max_until` |
+| `expired` on a `trial` licence | Plan error `Trial licence expired` with the same two ways out |
 | `expires_soon` / `expired` on a licence with `contract_position_id` | Nothing: the term follows the contract |
 | `suspended` | Warns `Licence suspended in the AI Hub – Terraform does not intervene` (emergency stop in the portal); never resumes |
 | `ended`, `key_revoked` | As above: change `rotation_trigger` |
 
-`expires_soon` starts 30 days before the end, so a fresh trial (30 days by default) is extended to 60 days with the next apply, and a pinned end in that window warns on every plan.
+`expires_soon` is the Hub's verdict shortly before the end (14 days at the moment); the provider computes no window. A pinned end in that window warns on every plan.
 
 ### Lost answers
 

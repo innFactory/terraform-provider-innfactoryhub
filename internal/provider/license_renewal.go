@@ -27,8 +27,8 @@ func addMonthsClamped(t time.Time, months int) time.Time {
 }
 
 // unbilledLimit is the latest `unbilled.max_until` the Hub accepts for a
-// reason when counted from today: trial 60 days, partner and internal 12
-// months. today is the UTC date, never ahead of the Hub's Berlin date, so
+// reason when counted from today: partner and internal 12
+// months (trial 60 days is only the Hub's limit; trials are not renewed). today is the UTC date, never ahead of the Hub's Berlin date, so
 // the result is never beyond the Hub's limit.
 func unbilledLimit(reason string, today time.Time) (time.Time, bool) {
 	switch reason {
@@ -50,7 +50,7 @@ var renewalClock = func() time.Time {
 // the portal no longer changes Terraform's licences. An unbilled licence that
 // expires soon or has expired gets a longer end planned (an in-place update:
 // same licence, same key); a licence suspended in the portal only warns —
-// that is an emergency stop Terraform must not undo. A licence on a contract
+// that is an emergency stop Terraform must not undo. Trials are never renewed. A licence on a contract
 // position follows its contract and is never touched. Ended licences and
 // revoked keys are handled through rotation_trigger (see ModifyPlan).
 func (r *licenseResource) planRenewal(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse, state, plan licenseModel) {
@@ -75,6 +75,10 @@ func (r *licenseResource) planRenewal(ctx context.Context, req resource.ModifyPl
 	current := state.UnbilledMaxUntil.ValueString()
 	if !plan.UnbilledMaxUntil.IsUnknown() && !plan.UnbilledMaxUntil.Equal(state.UnbilledMaxUntil) {
 		return // the configuration already sets a new end
+	}
+	if unbilledReason == "trial" {
+		planTrialEnd(resp, state, current, reason)
+		return
 	}
 	limit, ok := unbilledLimit(unbilledReason, renewalClock())
 	if !ok {
@@ -116,4 +120,17 @@ func (r *licenseResource) planRenewal(ctx context.Context, req resource.ModifyPl
 			fmt.Sprintf("Licence %s %s (%s). This apply extends it to %s in place; the licence key stays. "+
 				"Set auto_renew_unbilled = false to stop that, or contract_position_id to bill it.", state.ID.ValueString(), what, unbilledReason, next))
 	}
+}
+
+// planTrialEnd never renews a trial: one that is renewed over and over would
+// be a free licence nobody notices. It warns before the end and fails after.
+func planTrialEnd(resp *resource.ModifyPlanResponse, state licenseModel, end, reason string) {
+	const action = "bind it to a contract position (contract_position_id) or deliberately set unbilled_max_until"
+	if reason == renewalExpired {
+		resp.Diagnostics.AddAttributeError(path.Root("unbilled_max_until"), "Trial licence expired",
+			fmt.Sprintf("Trial licence %s expired on %s. Terraform does not renew trials: %s.", state.ID.ValueString(), end, action))
+		return
+	}
+	resp.Diagnostics.AddAttributeWarning(path.Root("unbilled_max_until"), "Trial licence ends soon",
+		fmt.Sprintf("Trial licence %s ends on %s. Terraform does not renew trials: %s.", state.ID.ValueString(), end, action))
 }

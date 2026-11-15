@@ -53,7 +53,6 @@ func TestLicenseRenewalExtendsUnbilledLicense(t *testing.T) {
 		reason string
 		want   string
 	}{
-		{"trial", day(60)},
 		{"partner", fakeToday().AddDate(0, 12, 0).Format(isoDay)},
 		{"internal", fakeToday().AddDate(0, 12, 0).Format(isoDay)},
 	}
@@ -139,6 +138,42 @@ func TestLicenseRenewalRevivesExpiredLicense(t *testing.T) {
 	})
 }
 
+// Trials are never renewed: a warning before the end, an error after it.
+func TestLicenseRenewalNeverRenewsTrial(t *testing.T) {
+	hub := newLicenseHub(t)
+	hub.enableRenewal()
+	useFakeHubEnv(t)
+	cfg := licenseConfig(hub, unbilledGateway("trial"))
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		CheckDestroy:             checkLicensesEnded(hub),
+		Steps: []resource.TestStep{
+			{Config: cfg, Check: captureAttr(licAddr, "id", &id)},
+			{
+				PreConfig: func() { hub.setUnbilledEndOutOfBand(id, day(5), "active") },
+				Config:    cfg,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+				Check: resource.TestCheckResourceAttr(licAddr, "renewal_reason", "expires_soon"),
+			},
+			{
+				PreConfig:   func() { hub.setUnbilledEndOutOfBand(id, day(-1), "expired") },
+				Config:      cfg,
+				PlanOnly:    true,
+				ExpectError: regexpFlat("Terraform does not renew trials"),
+			},
+			{
+				// A deliberately set end is the way out.
+				PreConfig: func() { hub.setUnbilledEndOutOfBand(id, day(5), "active") },
+				Config:    licenseConfig(hub, unbilledGateway("trial").with(licenseAttrs{"unbilled_max_until": fmt.Sprintf("%q", day(40))})),
+				Check:     resource.TestCheckResourceAttr(licAddr, "unbilled_max_until", day(40)),
+			},
+		},
+	})
+}
+
 // Fresh licences and licences far from their end are not touched.
 func TestLicenseRenewalLeavesHealthyLicenseAlone(t *testing.T) {
 	hub := newLicenseHub(t)
@@ -165,8 +200,8 @@ func TestLicenseRenewalRefusedWhenNotAutomatic(t *testing.T) {
 		wantErr string
 	}{
 		{name: "auto_renew_unbilled = false",
-			before:  unbilledGateway("trial").with(licenseAttrs{"auto_renew_unbilled": "false", "unbilled_max_until": fmt.Sprintf("%q", day(10))}),
-			after:   unbilledGateway("trial").with(licenseAttrs{"auto_renew_unbilled": "false"}),
+			before:  unbilledGateway("partner").with(licenseAttrs{"auto_renew_unbilled": "false", "unbilled_max_until": fmt.Sprintf("%q", day(10))}),
+			after:   unbilledGateway("partner").with(licenseAttrs{"auto_renew_unbilled": "false"}),
 			wantErr: `auto_renew_unbilled is false`},
 	}
 	for _, tc := range cases {
@@ -357,6 +392,18 @@ func TestLicenseRenewalPlanUnit(t *testing.T) {
 	t.Run("auto_renew_unbilled = false fails", func(t *testing.T) {
 		o := map[string]any{"auto_renew_unbilled": false}
 		resp := modifyPlanWithConfig(t, newLicenseResource(), with(o), with(o), cfgOf(with(o)))
+		if !resp.Diagnostics.HasError() {
+			t.Fatal("expected an error")
+		}
+	})
+	t.Run("trial: warns before the end, fails after", func(t *testing.T) {
+		soon := map[string]any{"unbilled_reason": "trial"}
+		resp := modifyPlanWithConfig(t, newLicenseResource(), with(soon), with(soon), cfgOf(with(soon)))
+		if resp.Diagnostics.HasError() || !warningWith(resp.Diagnostics, "Trial licence ends soon") || warningWith(resp.Diagnostics, "Renewing") {
+			t.Fatalf("diagnostics: %v", resp.Diagnostics)
+		}
+		gone := map[string]any{"unbilled_reason": "trial", "renewal_reason": "expired"}
+		resp = modifyPlanWithConfig(t, newLicenseResource(), with(gone), with(gone), cfgOf(with(gone)))
 		if !resp.Diagnostics.HasError() {
 			t.Fatal("expected an error")
 		}
