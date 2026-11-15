@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
@@ -1047,4 +1049,167 @@ func TestLicenseImportRemembersConfigurationAtFirstApply(t *testing.T) {
 func TestLicenseUnbilledOnALeapDay(t *testing.T) {
 	t.Run("create", func(t *testing.T) { fixToday(t, "2028-02-29"); TestLicenseCreateUnbilled(t) })
 	t.Run("defaults", func(t *testing.T) { fixToday(t, "2028-02-29"); TestLicenseUpdatePlanKeepsHubDefaults(t) })
+}
+
+// pinnedPartner is a partner licence whose end the configuration pins.
+func pinnedPartner(hub *fakeHub, until string) string {
+	return licenseConfig(hub, unbilledGateway("partner").with(licenseAttrs{"unbilled_max_until": fmt.Sprintf("%q", until)}))
+}
+
+// A pinned end is never renewed and never planned unknown, whatever staff do
+// in the portal: no "invalid plan", only a warning.
+func TestLicenseRenewalNeverPlansAPinnedEndUnknown(t *testing.T) {
+	cases := []struct {
+		name   string
+		portal func(hub *fakeHub, id string)
+	}{
+		{"staff moved the end, it now runs out", func(hub *fakeHub, id string) { hub.setUnbilledEndOutOfBand(id, day(8), "active") }},
+		{"staff shortened the pinned end", func(hub *fakeHub, id string) { hub.setUnbilledEndOutOfBand(id, day(8), "active") }},
+		{"staff changed the reason", func(hub *fakeHub, id string) {
+			hub.mu.Lock()
+			l := hub.licenses[id]
+			l.Unbilled.Reason, l.Unbilled.MaxUntil, l.ValidUntil = "internal", day(8), day(8)
+			hub.mu.Unlock()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fixToday(t, "2026-11-15")
+			hub := newLicenseHub(t)
+			hub.enableRenewal()
+			useFakeHubEnv(t)
+			cfg := pinnedPartner(hub, day(50))
+			var id string
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testProviderFactories(),
+				CheckDestroy:             checkLicensesEnded(hub),
+				Steps: []resource.TestStep{
+					{Config: cfg, Check: captureAttr(licAddr, "id", &id)},
+					{
+						PreConfig:        func() { tc.portal(hub, id); hub.resetCalls() },
+						Config:           cfg,
+						ConfigPlanChecks: emptyPlan(),
+						Check:            hubWrites(hub),
+					},
+				},
+			})
+		})
+	}
+}
+
+// A saved pin that staff moved far out and that later runs into the window:
+// still no renewal, no invalid plan.
+func TestLicenseRenewalPinnedEndMovedByStaffLaterExpires(t *testing.T) {
+	fixToday(t, "2026-11-15")
+	hub := newLicenseHub(t)
+	hub.enableRenewal()
+	useFakeHubEnv(t)
+	cfg := pinnedPartner(hub, day(50))
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		CheckDestroy:             checkLicensesEnded(hub),
+		Steps: []resource.TestStep{
+			{Config: cfg, Check: captureAttr(licAddr, "id", &id)},
+			{PreConfig: func() { hub.setUnbilledEndOutOfBand(id, day(100), "active") }, Config: cfg, ConfigPlanChecks: emptyPlan()},
+			{
+				// Ninety days later the Hub's end is inside the window.
+				PreConfig:        func() { fixToday(t, "2027-02-20"); hub.resetCalls() },
+				Config:           cfg,
+				ConfigPlanChecks: emptyPlan(),
+				Check:            hubWrites(hub),
+			},
+		},
+	})
+}
+
+// Replacing a licence staff linked to a position warns that the link is
+// dropped; the licence is then issued from the configuration.
+func TestLicenseReplacementWarnsThatAPortalPositionIsDropped(t *testing.T) {
+	fixToday(t, "2026-11-15")
+	hub := newLicenseHub(t)
+	hub.enableRenewal()
+	useFakeHubEnv(t)
+	var mu sync.Mutex
+	var seen []string
+	planDiagnosticsHook = func(d diag.Diagnostics) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, x := range d {
+			seen = append(seen, x.Summary())
+		}
+	}
+	t.Cleanup(func() { planDiagnosticsHook = nil })
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		CheckDestroy:             checkLicensesEnded(hub),
+		Steps: []resource.TestStep{
+			{Config: licenseConfig(hub, unbilledGateway("partner")), Check: captureAttr(licAddr, "id", &id)},
+			{
+				PreConfig: func() { hub.linkPositionOutOfBand(id, alphaPositionID); mu.Lock(); seen = nil; mu.Unlock() },
+				Config: licenseConfig(hub, unbilledGateway("partner").with(licenseAttrs{
+					"environment_id": fmt.Sprintf("%q", alphaStagingEnvID), "domains": `["gpt.alpha.example"]`})),
+				Check: func(*terraform.State) error {
+					mu.Lock()
+					defer mu.Unlock()
+					for _, s := range seen {
+						if strings.Contains(s, "Replacing the licence drops a billing link") {
+							return nil
+						}
+					}
+					return fmt.Errorf("no replacement warning in %v", seen)
+				},
+			},
+		},
+	})
+}
+
+// Import of a licence staff linked to a position, configuration trial, first
+// apply; staff then set a trial in the portal — which is what the
+// configuration says: state follows the Hub, and an expired trial fails.
+func TestLicenseHubLinkEqualToTheConfigurationIsFollowed(t *testing.T) {
+	fixToday(t, "2026-11-15")
+	hub := newLicenseHub(t)
+	hub.enableRenewal()
+	useFakeHubEnv(t)
+	id := seedLicenseIn(hub, "lic_import000004", alphaEnvID, "ai-gateway", "active")
+	hub.mu.Lock()
+	hub.licenses[id].aware = true
+	hub.mu.Unlock()
+	hub.linkPositionOutOfBand(id, alphaPositionID)
+	base := unbilledGateway("trial").with(licenseAttrs{"domains": `["gpt.example.com"]`, "max_users": "5"})
+	cfg := licenseConfig(hub, base)
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		CheckDestroy:             func(*terraform.State) error { return nil },
+		Steps: []resource.TestStep{
+			{Config: cfg, ImportState: true, ResourceName: licAddr, ImportStateId: id, ImportStatePersist: true},
+			{Config: cfg}, // the first apply keeps the Hub's position
+			{
+				// Staff unlink it and set a trial: now Hub = configuration.
+				PreConfig: func() {
+					hub.mu.Lock()
+					l := hub.licenses[id]
+					old := l.ContractPositionID
+					l.ContractPositionID, l.ContractID = nil, nil
+					l.Unbilled = &fakeUnbilled{Reason: "trial", MaxUntil: day(10)}
+					l.ValidUntil = day(10)
+					hub.linkPositionLocked(l, old)
+					hub.mu.Unlock()
+				},
+				Config: cfg,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(licAddr, "contract_position_id"),
+					resource.TestCheckResourceAttr(licAddr, "unbilled_reason", "trial"),
+				),
+			},
+			{
+				PreConfig:   func() { hub.setUnbilledEndOutOfBand(id, day(-1), "expired") },
+				Config:      cfg,
+				PlanOnly:    true,
+				ExpectError: regexpFlat("Trial licence expired"),
+			},
+		},
+	})
 }

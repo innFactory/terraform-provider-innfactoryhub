@@ -869,7 +869,9 @@ func (r *licenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 		storeBillingConfig(ctx, resp.Private, last, &resp.Diagnostics)
 	}
 	applied := appliedLink(state)
-	diverged := hasLast && linkDiverged(applied, hubL, last)
+	// A Hub link that is the configured one (e.g. staff set what the
+	// configuration says) is no divergence: state follows the Hub.
+	diverged := hasLast && linkDiverged(applied, hubL, last) && !hubMatchesConfig(hubL, last)
 	savedPos, savedReason, savedUntil := state.ContractPositionID, state.UnbilledReason, state.UnbilledMaxUntil
 	state.applyRemote(ctx, &resp.Diagnostics, hub)
 	if diverged {
@@ -890,12 +892,17 @@ func (r *licenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 // rotation_trigger change acts on them — a new licence for an ended one, an
 // in-place key rotation otherwise.
 func (r *licenseResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	defer func() {
+		if planDiagnosticsHook != nil {
+			planDiagnosticsHook(resp.Diagnostics)
+		}
+	}()
 	if req.Plan.Raw.IsNull() {
 		return // destroy
 	}
 	if req.State.Raw.IsNull() {
 		refuseAirGappedCreate(ctx, req, resp)
-		planBillingLink(ctx, req, resp, nil)
+		planBillingLink(ctx, req, resp, nil, false)
 		return
 	}
 	var state, plan licenseModel
@@ -904,9 +911,13 @@ func (r *licenseResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	planBillingLink(ctx, req, resp, &state)
-	resp.Diagnostics.Append(resp.Plan.Get(ctx, &plan)...)
 	rotate := !plan.RotationTrigger.Equal(state.RotationTrigger)
+	// A replacement: another environment or product (attribute modifiers
+	// replace), or a rotation of an ended licence.
+	replacing := !plan.EnvironmentID.Equal(state.EnvironmentID) || !plan.Product.Equal(state.Product) ||
+		(state.Status.ValueString() == licenseStatusEnded && rotate)
+	planBillingLink(ctx, req, resp, &state, replacing)
+	resp.Diagnostics.Append(resp.Plan.Get(ctx, &plan)...)
 	trigger := path.Root("rotation_trigger")
 
 	switch {

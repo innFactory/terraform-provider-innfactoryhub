@@ -141,11 +141,20 @@ func (r *licenseResource) planRenewal(ctx context.Context, req resource.ModifyPl
 		summary = "Unbilled licence expired"
 	}
 	switch {
-	case cfg.MaxUntil != nil && matches:
-		// A date the operator pinned (and Terraform applied) is theirs.
-		diagnose(resp, expired, path.Root("unbilled_max_until"), summary,
-			fmt.Sprintf("Licence %s %s (%s) and unbilled_max_until is pinned to %s in the configuration, so Terraform does not renew it. "+
-				"Remove the attribute to let Terraform renew it, or %s.", state.ID.ValueString(), what, hubReason, *cfg.MaxUntil, options))
+	case cfg.MaxUntil != nil:
+		// A date pinned in the configuration is never renewed automatically
+		// and never planned unknown (Terraform requires the configured value).
+		// Where the Hub's link is not the applied one, staff changed it in the
+		// portal: that is a warning only.
+		if matches {
+			diagnose(resp, expired, path.Root("unbilled_max_until"), summary,
+				fmt.Sprintf("Licence %s %s (%s) and unbilled_max_until is pinned to %s in the configuration, so Terraform does not renew it. "+
+					"Remove the attribute to let Terraform renew it, or %s.", state.ID.ValueString(), what, hubReason, *cfg.MaxUntil, options))
+		} else {
+			diagnose(resp, false, path.Root("unbilled_max_until"), summary,
+				fmt.Sprintf("Licence %s %s (%s in the AI Hub, changed in the portal) and unbilled_max_until is pinned to %s in the configuration, so Terraform does not renew it. "+
+					"Clarify it in the portal, or remove the attribute to let Terraform renew it.", state.ID.ValueString(), what, hubReason, *cfg.MaxUntil))
+		}
 	case !plan.AutoRenewUnbilled.IsNull() && !plan.AutoRenewUnbilled.ValueBool():
 		diagnose(resp, expired, path.Root("auto_renew_unbilled"), summary,
 			fmt.Sprintf("Licence %s %s (%s) and auto_renew_unbilled is false. Set auto_renew_unbilled = true to let Terraform extend it, or %s.",
@@ -328,7 +337,7 @@ func deref(s *string) string {
 // and the configuration names none, the Hub's position stays and the plan
 // warns. The billing attributes are computed, so every case sets them
 // explicitly (state is nil for a create).
-func planBillingLink(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse, state *licenseModel) {
+func planBillingLink(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse, state *licenseModel, replacing bool) {
 	cfg, d := configuredBilling(ctx, req.Config)
 	resp.Diagnostics.Append(d...)
 	var cfgPosition, cfgReason types.String
@@ -380,7 +389,7 @@ func planBillingLink(ctx context.Context, req resource.ModifyPlanRequest, resp *
 	}
 	// Differences between the Hub and what Terraform applied (set by Read).
 	if state != nil && req.Private != nil {
-		if hub := hubBillingDiff(ctx, req.Private); hub != "" && len(resp.RequiresReplace) > 0 {
+		if hub := hubBillingDiff(ctx, req.Private); hub != "" && replacing {
 			resp.Diagnostics.AddWarning("Replacing the licence drops a billing link set in the portal",
 				fmt.Sprintf("Licence %s: the AI Hub has %s (changed in the portal). The replacement is issued from the configuration, so that link is dropped.",
 					state.ID.ValueString(), hub))
@@ -514,4 +523,13 @@ func lastBillingConfigOf(ctx context.Context, cfg interface {
 }) (billingConfig, bool) {
 	b, d := configuredBilling(ctx, cfg)
 	return b, !d.HasError()
+}
+
+// planDiagnosticsHook lets tests read the diagnostics of ModifyPlan.
+var planDiagnosticsHook func(diag.Diagnostics)
+
+// hubMatchesConfig reports whether the Hub's link is the configured one.
+func hubMatchesConfig(hub, cfg billingConfig) bool {
+	return equalStrPtr(hub.Position, cfg.Position) && equalStrPtr(hub.Reason, cfg.Reason) &&
+		(cfg.MaxUntil == nil || equalStrPtr(hub.MaxUntil, cfg.MaxUntil))
 }
