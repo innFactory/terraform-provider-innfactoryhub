@@ -78,7 +78,7 @@ resource "innfactoryhub_license" "ai_gateway" {
   domains              = ["gpt.acme.example"]
   max_users            = 50 # or: unlimited = true
   edition              = "all"
-  contract_position_id = "pos_0123456789ab" # or: unbilled_reason = "trial"
+  contract_position_id = "pos_0123456789ab" # or: unbilled_reason = "partner"
 }
 
 output "license_key" {

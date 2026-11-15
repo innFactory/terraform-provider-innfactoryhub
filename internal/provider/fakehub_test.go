@@ -69,6 +69,9 @@ type fakeHub struct {
 	idempotencyKeys []string
 	// replayAs, when set, is the licence id every idempotent replay names.
 	replayAs string
+	// renewalAware makes new licences report managed_by and renewal, like
+	// an AI Hub from Spec 003 (off: an older Hub).
+	renewalAware bool
 	// lastLookup is the query of the latest tenant lookup (nil = none).
 	lastLookup url.Values
 	// handlesOmitted plays innfactoryHUB (or an AI Hub before handles): the

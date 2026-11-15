@@ -30,6 +30,14 @@ func modifyPlan(t *testing.T, r fwresource.Resource, state, plan map[string]stri
 // attribute values.
 func modifyPlanValues(t *testing.T, r fwresource.Resource, state, plan map[string]any) fwresource.ModifyPlanResponse {
 	t.Helper()
+	return modifyPlanWithConfig(t, r, state, plan, plan)
+}
+
+// modifyPlanWithConfig is modifyPlanValues with a configuration of its own,
+// for attributes the plan fills in (computed, defaulted) but the
+// configuration leaves unset.
+func modifyPlanWithConfig(t *testing.T, r fwresource.Resource, state, plan, config map[string]any) fwresource.ModifyPlanResponse {
+	t.Helper()
 	ctx := context.Background()
 	var schemaResp fwresource.SchemaResponse
 	r.Schema(ctx, fwresource.SchemaRequest{}, &schemaResp)
@@ -60,8 +68,9 @@ func modifyPlanValues(t *testing.T, r fwresource.Resource, state, plan map[strin
 	planned := tfsdk.Plan{Schema: schemaResp.Schema, Raw: raw(plan)}
 	resp := fwresource.ModifyPlanResponse{Plan: planned}
 	m.ModifyPlan(ctx, fwresource.ModifyPlanRequest{
-		State: tfsdk.State{Schema: schemaResp.Schema, Raw: raw(state)},
-		Plan:  planned,
+		Config: tfsdk.Config{Schema: schemaResp.Schema, Raw: raw(config)},
+		State:  tfsdk.State{Schema: schemaResp.Schema, Raw: raw(state)},
+		Plan:   planned,
 	}, &resp)
 	return resp
 }

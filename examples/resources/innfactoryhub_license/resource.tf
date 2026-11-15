@@ -23,7 +23,7 @@ variable "max_users" {
 variable "contract_position_id" {
   type        = string
   default     = null
-  description = "Contract position that bills the licence; null issues a trial."
+  description = "Contract position that bills the licence; null issues a partner licence."
 }
 
 resource "innfactoryhub_license" "ai_gateway" {
@@ -37,9 +37,9 @@ resource "innfactoryhub_license" "ai_gateway" {
   unlimited = var.max_users == null
 
   # Exactly one: the contract position that bills the licence, or why it is
-  # not billed (trial | partner | internal; end defaults per reason).
+  # not billed (partner | internal renew automatically; a trial never does).
   contract_position_id = var.contract_position_id
-  unbilled_reason      = var.contract_position_id == null ? "trial" : null
+  unbilled_reason      = var.contract_position_id == null ? "partner" : null
 
   # Air-gap operation (licence files instead of the daily online check) is
   # switched on by AI Hub staff in the portal only. Leave this unset to keep

@@ -13,6 +13,8 @@ The customer is named by **exactly one** of `tenant_id`, `companygpt_handle`, `a
 
 For CompanyGPT rollouts bind by **`companygpt_handle`** — the deployment name such as `innfactory`, `lmu` or `ksob`. The Hub keeps each handle unique across customers (no `409 ambiguous_lookup`), and every CompanyGPT stack knows its own name, whatever cloud it runs in; cloud identifiers remain for installations without a handle.
 
+**Unknown handle:** with an AI Hub from Spec 003 on, a `companygpt_handle` that belongs to no customer does not fail with `404 tenant_not_found` — the Hub creates a **placeholder customer** (“Nicht zugeordnet: <handle>”) in the same transaction and registers the environment there; staff assign it to the real customer in the portal later (the environment and its licences move along). Older Hubs still answer `404`. Cloud identifiers and `tenant_id` never create a customer.
+
 | Change | Effect |
 |---|---|
 | `name`, `domain` | Updated in place (`PATCH`), `id` stays the same |

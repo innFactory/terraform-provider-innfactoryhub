@@ -78,6 +78,10 @@ type licenseModel struct {
 	TenantID           types.String `tfsdk:"tenant_id"`
 	Status             types.String `tfsdk:"status"`
 	ValidUntil         types.String `tfsdk:"valid_until"`
+	AutoRenewUnbilled  types.Bool   `tfsdk:"auto_renew_unbilled"`
+	ManagedBy          types.String `tfsdk:"managed_by"`
+	RenewalDue         types.Bool   `tfsdk:"renewal_due"`
+	RenewalReason      types.String `tfsdk:"renewal_reason"`
 }
 
 const licenseStatusEnded = "ended"
@@ -194,14 +198,18 @@ func (r *licenseResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
 			},
 			"contract_position_id": schema.StringAttribute{
-				Optional:    true,
-				Description: "Contract position that bills the licence. Set either this or `unbilled_reason`.",
-				Validators:  []validator.String{hubRefID},
+				Optional: true,
+				Computed: true,
+				Description: "Contract position that bills the licence. Set either this or `unbilled_reason`. Staff may link the licence to a contract position in the portal later: " +
+					"while this configuration is unchanged since the last apply, the AI Hub's link stays; a changed configuration wins.",
+				Validators: []validator.String{hubRefID},
 			},
 			"unbilled_reason": schema.StringAttribute{
-				Optional:    true,
-				Description: "Why the licence is not billed: `trial`, `partner` or `internal`. Set either this or `contract_position_id`.",
-				Validators:  []validator.String{stringvalidator.OneOf(unbilledReasons...)},
+				Optional: true,
+				Computed: true,
+				Description: "Why the licence is not billed: `trial`, `partner` or `internal`. Set either this or `contract_position_id`. " +
+					"Staff may change it in the portal: while the billing configuration is unchanged since the last apply, the AI Hub's link stays; a changed configuration wins.",
+				Validators: []validator.String{stringvalidator.OneOf(unbilledReasons...)},
 			},
 			"unbilled_max_until": schema.StringAttribute{
 				Optional:    true,
@@ -212,6 +220,15 @@ func (r *licenseResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					stringvalidator.AlsoRequires(path.MatchRoot("unbilled_reason")),
 				},
 				PlanModifiers: []planmodifier.String{useStateUnlessChanged("unbilled_reason")},
+			},
+			"auto_renew_unbilled": schema.BoolAttribute{
+				Optional: true,
+				Computed: true,
+				Default:  booldefault.StaticBool(true),
+				Description: "Only for licences with `unbilled_reason`. `true` (default): when the AI Hub reports that the licence is about to expire " +
+					"(14 days) or has expired (`renewal_reason`), the plan renews a `partner` or `internal` licence to 12 months from the day of the apply, in place — no new key. " +
+					"Trials are never renewed. `false`: Terraform never renews; an ending licence only warns, an expired one fails the plan with what to do. A licence on a contract position is never changed: it follows the contract. " +
+					"Has no effect when `unbilled_max_until` is set in the configuration — raise that date yourself.",
 			},
 			"rotation_trigger": schema.StringAttribute{
 				Optional: true,
@@ -245,12 +262,26 @@ func (r *licenseResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			},
 			"status": schema.StringAttribute{
 				Computed: true,
-				Description: "`active`, `suspended`, `expired` or `ended`. Terraform never changes it: a licence suspended or ended in the Hub stays so; " +
+				Description: "`active`, `suspended`, `expired` or `ended`. Terraform never resumes or un-ends it (a licence suspended or ended in the Hub stays so); only the renewal of an unbilled licence makes an expired one `active` again. " +
 					"for an ended one, plans fail until `rotation_trigger` changes (which issues a new licence).",
 			},
 			"valid_until": schema.StringAttribute{
 				Computed:    true,
 				Description: "Last day the licence is valid (`YYYY-MM-DD`).",
+			},
+			"managed_by": schema.StringAttribute{
+				Computed: true,
+				Description: "Who manages the licence in the AI Hub: `terraform` (issued with an API key — the portal only suspends it) or `portal`. " +
+					"Null for an AI Hub that does not report it.",
+			},
+			"renewal_due": schema.BoolAttribute{
+				Computed:    true,
+				Description: "The AI Hub's verdict that the licence needs attention (see `renewal_reason`). Null for an AI Hub that does not report it.",
+			},
+			"renewal_reason": schema.StringAttribute{
+				Computed: true,
+				Description: "Why the AI Hub wants the licence renewed: `expires_soon` (unbilled, ends within 14 days at the moment), `expired`, `ended`, `suspended` " +
+					"or `key_revoked`; null if nothing is due or the AI Hub does not report it. See `auto_renew_unbilled`.",
 			},
 		},
 	}
@@ -356,6 +387,15 @@ type licenseDTO struct {
 	Params             licenseParamsDTO `json:"params"`
 	ValidUntil         string           `json:"valid_until"`
 	Status             string           `json:"status"`
+	// ManagedBy and Renewal come with AI Hub Spec 003; older Hubs omit them.
+	ManagedBy *string         `json:"managed_by"`
+	Renewal   *licenseRenewal `json:"renewal"`
+}
+
+// licenseRenewal is `renewal` of a licence response.
+type licenseRenewal struct {
+	Due    bool    `json:"due"`
+	Reason *string `json:"reason"`
 }
 
 // licenseKeyInfo is LicenseKeyInfo without the fields the provider ignores.
@@ -432,9 +472,14 @@ var licenseHints = map[string]string{
 	"air_gapped_staff_only":     airGapStaffOnlyHint,
 	"air_gapped_unsupported": "Air-gap operation exists only for ai-gateway licences (details.product is this licence's product). " +
 		"Remove air_gapped or set it to false.",
+	"license_suspended": suspendedHint,
 	"license_ended": "The licence was ended in the AI Hub. Terraform does not re-issue it on its own: change rotation_trigger to issue a new licence, " +
 		"or remove the resource from the configuration.",
 }
+
+// suspendedHint explains the AI Hub's 409 license_suspended on end or create.
+const suspendedHint = "The licence is suspended in the AI Hub (emergency stop) — Terraform cannot end or replace it, " +
+	"and cannot issue another one for this environment and product, until a staff member resumes it in the portal."
 
 // airGapStaffOnlyHint explains the AI Hub's 403 air_gapped_staff_only: only
 // staff switch air-gap operation on, never an API key — and the provider
@@ -549,6 +594,7 @@ func (m *licenseModel) fillComputed(ctx context.Context, diags *diag.Diagnostics
 	m.TenantID = types.StringValue(l.TenantID)
 	m.Status = types.StringValue(l.Status)
 	m.ValidUntil = types.StringValue(l.ValidUntil)
+	m.setRenewal(l)
 	if m.Features.IsUnknown() {
 		m.Features = strSet(ctx, diags, l.Params.Features)
 	}
@@ -580,13 +626,33 @@ func (m *licenseModel) applyRemote(ctx context.Context, diags *diag.Diagnostics,
 	// Also fills state written before air_gapped existed (null).
 	m.AirGapped = types.BoolValue(l.Params.AirGapped)
 	m.ContractPositionID = types.StringPointerValue(l.ContractPositionID)
-	m.UnbilledReason, m.UnbilledMaxUntil = types.StringNull(), types.StringNull()
 	if l.Unbilled != nil {
 		m.UnbilledReason = types.StringValue(l.Unbilled.Reason)
 		m.UnbilledMaxUntil = types.StringValue(l.Unbilled.MaxUntil)
+	} else if l.ContractPositionID == nil || m.UnbilledReason.IsNull() {
+		m.UnbilledReason, m.UnbilledMaxUntil = types.StringNull(), types.StringNull()
 	}
+	// else: staff linked the licence to a position in the portal. The reason
+	// the configuration still names stays in state (it is ignored, see
+	// planBillingLink), so the plan shows no difference.
 	m.Status = types.StringValue(l.Status)
 	m.ValidUntil = types.StringValue(l.ValidUntil)
+	m.setRenewal(l)
+	// State written before the attribute existed, and import: the default.
+	if m.AutoRenewUnbilled.IsNull() || m.AutoRenewUnbilled.IsUnknown() {
+		m.AutoRenewUnbilled = types.BoolValue(true)
+	}
+}
+
+// setRenewal copies managed_by and the renewal verdict; an AI Hub that does
+// not report them leaves them null.
+func (m *licenseModel) setRenewal(l licenseDTO) {
+	m.ManagedBy = types.StringPointerValue(l.ManagedBy)
+	m.RenewalDue, m.RenewalReason = types.BoolNull(), types.StringNull()
+	if l.Renewal != nil {
+		m.RenewalDue = types.BoolValue(l.Renewal.Due)
+		m.RenewalReason = types.StringPointerValue(l.Renewal.Reason)
+	}
 }
 
 func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -604,7 +670,7 @@ func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest
 	// one (e.g. issued by an earlier apply whose answer was lost) is never
 	// issued a second time; the operator adopts or ends it (SEC-014).
 	envID, product := plan.EnvironmentID.ValueString(), plan.Product.ValueString()
-	running, err := r.runningLicenses(ctx, envID, product)
+	running, suspended, err := r.runningLicenses(ctx, envID, product)
 	if err != nil {
 		failCreate(ctx, resp, "Create licence failed", fmt.Sprintf("Looking up the running licences of environment %s failed: %s",
 			envID, withHint(err, licenseHints)))
@@ -614,8 +680,8 @@ func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest
 		failCreate(ctx, resp, "Licence already running for this environment and product",
 			fmt.Sprintf("Environment %s already has a running %s licence: %s. Terraform issues at most one and never takes one over on its own, "+
 				"so a licence issued by an earlier apply (e.g. one whose answer was lost) is not issued twice. Adopt it with "+
-				"`terraform import <address> <license_id>` and change rotation_trigger to get its key into state, or end it in the portal, then apply again.",
-				envID, product, strings.Join(running, ", ")))
+				"`terraform import <address> <license_id>` and change rotation_trigger to get its key into state, or end it in the portal, then apply again.%s",
+				envID, product, strings.Join(running, ", "), suspendedNote(suspended)))
 		return
 	}
 
@@ -625,7 +691,7 @@ func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest
 	var existing []string
 	var env envelope[licenseCreateResponse]
 	retried, err := r.client.create(ctx, licensesPath, body, &env, func() {
-		if ids, lerr := r.runningLicenses(ctx, envID, product); lerr == nil {
+		if ids, _, lerr := r.runningLicenses(ctx, envID, product); lerr == nil {
 			existing = ids
 		} else {
 			tflog.Warn(ctx, "license_lookup_failed", map[string]any{"environment_id": envID, "error": lerr.Error()})
@@ -639,6 +705,9 @@ func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest
 			return
 		}
 		r.adopt(ctx, &plan, id, resp)
+		if !resp.Diagnostics.HasError() {
+			rememberBillingConfig(ctx, req.Config, resp.Private, &resp.Diagnostics)
+		}
 		return
 	}
 	if err != nil {
@@ -662,6 +731,7 @@ func (r *licenseResource) Create(ctx context.Context, req resource.CreateRequest
 
 	plan.fillComputed(ctx, &resp.Diagnostics, env.Data.License)
 	plan.setKey(env.Data.LicenseKey, licenseKeyID(env.Data.LicenseKey))
+	rememberBillingConfig(ctx, req.Config, resp.Private, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
@@ -724,22 +794,34 @@ func (r *licenseResource) adopt(ctx context.Context, plan *licenseModel, id stri
 }
 
 // runningLicenses lists the licences of an environment and product that are
-// not ended.
-func (r *licenseResource) runningLicenses(ctx context.Context, envID, product string) ([]string, error) {
+// not ended, and which of them are suspended.
+func (r *licenseResource) runningLicenses(ctx context.Context, envID, product string) (ids, suspended []string, err error) {
 	var env envelope[struct {
 		Licenses []licenseDTO `json:"licenses"`
 	}]
 	if err := r.client.do(ctx, http.MethodGet, licensesPath, url.Values{"environment_id": {envID}}, nil, &env); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var ids []string
 	for _, l := range env.Data.Licenses {
 		if l.Product == product && l.Status != licenseStatusEnded {
 			ids = append(ids, l.LicenseID)
+			if l.Status == "suspended" {
+				suspended = append(suspended, l.LicenseID)
+			}
 		}
 	}
 	slices.Sort(ids)
-	return ids, nil
+	slices.Sort(suspended)
+	return ids, suspended, nil
+}
+
+// suspendedNote adds the emergency-stop explanation when a running licence
+// is suspended.
+func suspendedNote(suspended []string) string {
+	if len(suspended) == 0 {
+		return ""
+	}
+	return "\n\nSuspended in the AI Hub (emergency stop): " + strings.Join(suspended, ", ") + ". " + suspendedHint
 }
 
 func listOrNone(ids []string) string {
@@ -772,7 +854,35 @@ func (r *licenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 	// An ended licence stays in state with status "ended" — dropping it would
 	// re-issue it on the next apply and undo the Hub's decision (SEC-006).
 	// ModifyPlan refuses to plan it until rotation_trigger changes.
-	state.applyRemote(ctx, &resp.Diagnostics, env.Data.License)
+	//
+	// Billing link: with private state, a link that staff changed in the portal
+	// (a position, another reason) is not copied into state — state keeps what
+	// Terraform applied, so an unchanged configuration plans nothing. The
+	// Hub's link goes to private state for the plan's warning.
+	hub := env.Data.License
+	hubL := hubLinkOf(hub)
+	last, hasLast := lastBillingConfig(ctx, req.Private)
+	if !hasLast && !privateFlag(ctx, req.Private, privateImported) {
+		// State from before the configuration was remembered: derive it from
+		// state (an import keeps the simple rule until its first apply).
+		last, hasLast = rememberedFromState(state), true
+		storeBillingConfig(ctx, resp.Private, last, &resp.Diagnostics)
+	}
+	applied := appliedLink(state)
+	// A Hub link that is the configured one (e.g. staff set what the
+	// configuration says) is no divergence: state follows the Hub.
+	diverged := hasLast && linkDiverged(applied, hubL, last) && !hubMatchesConfig(hubL, last)
+	savedPos, savedReason, savedUntil := state.ContractPositionID, state.UnbilledReason, state.UnbilledMaxUntil
+	state.applyRemote(ctx, &resp.Diagnostics, hub)
+	if diverged {
+		// Keep what Terraform applied. The end follows the Hub unless
+		// Terraform pinned it (or state holds a position, which has none).
+		state.ContractPositionID, state.UnbilledReason = savedPos, savedReason
+		if last.MaxUntil != nil || !savedPos.IsNull() {
+			state.UnbilledMaxUntil = savedUntil
+		}
+	}
+	recordHubLink(ctx, resp.Private, hub, diverged, &resp.Diagnostics)
 	state.trackKey(env.Data.Keys)
 	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
 }
@@ -782,11 +892,17 @@ func (r *licenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 // rotation_trigger change acts on them — a new licence for an ended one, an
 // in-place key rotation otherwise.
 func (r *licenseResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	defer func() {
+		if planDiagnosticsHook != nil {
+			planDiagnosticsHook(resp.Diagnostics)
+		}
+	}()
 	if req.Plan.Raw.IsNull() {
 		return // destroy
 	}
 	if req.State.Raw.IsNull() {
 		refuseAirGappedCreate(ctx, req, resp)
+		planBillingLink(ctx, req, resp, nil, false)
 		return
 	}
 	var state, plan licenseModel
@@ -796,6 +912,12 @@ func (r *licenseResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		return
 	}
 	rotate := !plan.RotationTrigger.Equal(state.RotationTrigger)
+	// A replacement: another environment or product (attribute modifiers
+	// replace), or a rotation of an ended licence.
+	replacing := !plan.EnvironmentID.Equal(state.EnvironmentID) || !plan.Product.Equal(state.Product) ||
+		(state.Status.ValueString() == licenseStatusEnded && rotate)
+	planBillingLink(ctx, req, resp, &state, replacing)
+	resp.Diagnostics.Append(resp.Plan.Get(ctx, &plan)...)
 	trigger := path.Root("rotation_trigger")
 
 	switch {
@@ -820,6 +942,8 @@ func (r *licenseResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		// No rotation: the key stays as it is, including "no key" after import.
 		planKey(ctx, resp, state.LicenseKey, state.KeyID, state.KeyStatus)
 	}
+
+	r.planRenewal(ctx, req, resp, state, plan)
 
 	// Switching air-gap operation off is a reduction in the Hub: it revokes
 	// the licence files issued before. Only a configured false does it (an
@@ -876,7 +1000,10 @@ func (r *licenseResource) Update(ctx context.Context, req resource.UpdateRequest
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	body := patchBody(ctx, &resp.Diagnostics, plan, state)
+	hubL, _ := readHubLink(ctx, req.Private)
+	renewal := renewalReasonOf(ctx, req.Private)
+	endUnknown := plan.UnbilledMaxUntil.IsUnknown()
+	body := patchBody(ctx, &resp.Diagnostics, plan, state, hubL, renewal)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -896,7 +1023,20 @@ func (r *licenseResource) Update(ctx context.Context, req resource.UpdateRequest
 		return
 	}
 	plan.fillComputed(ctx, &resp.Diagnostics, env.Data.License)
+	if endUnknown && !plan.ContractPositionID.IsNull() {
+		// A renewal of the Hub's unbilled term next to a position Terraform
+		// applied: the position has no end of its own in state.
+		plan.UnbilledMaxUntil = types.StringNull()
+	}
 	plan.LicenseKey, plan.KeyID, plan.KeyStatus = state.LicenseKey, state.KeyID, state.KeyStatus
+	rememberBillingConfig(ctx, req.Config, resp.Private, &resp.Diagnostics)
+	if last, ok := lastBillingConfigOf(ctx, req.Config); ok {
+		recordHubLink(ctx, resp.Private, env.Data.License, linkDiverged(appliedLink(plan), hubLinkOf(env.Data.License), last), &resp.Diagnostics)
+	}
+	if resp.Private != nil {
+		raw, _ := json.Marshal("")
+		resp.Diagnostics.Append(resp.Private.SetKey(ctx, privateRenewal, raw)...)
+	}
 
 	if !plan.RotationTrigger.Equal(state.RotationTrigger) {
 		var rot envelope[licenseKeyRotation]
@@ -918,19 +1058,30 @@ func (b licensePatchBody) isEmpty() bool {
 }
 
 // patchBody diffs plan against state: changed params, and the billing link
-// only when it changes (the same position or reason is never re-sent).
-func patchBody(ctx context.Context, diags *diag.Diagnostics, plan, state licenseModel) licensePatchBody {
+// only when it changes (the same position or reason is never re-sent, and
+// nothing that the Hub already has). A renewal (the marker from ModifyPlan)
+// sends the Hub's own reason with the new end and never touches the position.
+func patchBody(ctx context.Context, diags *diag.Diagnostics, plan, state licenseModel, hub billingConfig, renewal string) licensePatchBody {
 	body := licensePatchBody{Params: paramsPatch(ctx, diags, plan, state)}
+	if renewal != "" {
+		if limit, ok := unbilledLimit(renewal, renewalClock()); ok {
+			body.Unbilled = &licenseUnbilled{Reason: renewal, MaxUntil: limit.Format(isoDateLayout)}
+			return body
+		}
+	}
 	position, unbilled := plan.billingLink()
 	switch {
 	case position != "":
-		if !plan.ContractPositionID.Equal(state.ContractPositionID) {
+		if !plan.ContractPositionID.Equal(state.ContractPositionID) && position != deref(hub.Position) {
 			body.ContractPositionID = position
 		}
 	case unbilled != nil:
 		reasonChanged := !plan.UnbilledReason.Equal(state.UnbilledReason)
 		endChanged := unbilled.MaxUntil != "" && !plan.UnbilledMaxUntil.Equal(state.UnbilledMaxUntil)
-		if reasonChanged || endChanged {
+		// The Hub already has it (e.g. a pin removed from the configuration
+		// takes the Hub's end): nothing to write.
+		hubHasIt := hub.Reason != nil && *hub.Reason == unbilled.Reason && (unbilled.MaxUntil == "" || unbilled.MaxUntil == deref(hub.MaxUntil))
+		if (reasonChanged || endChanged) && !hubHasIt {
 			body.Unbilled = unbilled
 		}
 	}
@@ -995,6 +1146,11 @@ func (r *licenseResource) Delete(ctx context.Context, req resource.DeleteRequest
 // be recovered: the Hub stores only its hash.
 func (r *licenseResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
+	if resp.Private != nil {
+		// No remembered configuration yet: the simple billing rule holds until
+		// the first create or update.
+		resp.Diagnostics.Append(resp.Private.SetKey(ctx, privateImported, []byte("true"))...)
+	}
 	resp.Diagnostics.AddWarning(
 		"Licence key not recoverable on import",
 		"The Hub returns a licence key only when it issues the licence or rotates its key, so license_key is empty after import. "+
